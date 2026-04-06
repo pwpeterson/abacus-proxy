@@ -1,0 +1,41 @@
+[Unit]
+Description=Abacus/RouterLLM Proxy Service
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+Image=localhost/abacus-proxy:latest
+ContainerName=abacus-proxy
+Network=host
+
+EnvironmentFile=/etc/containers/systemd/.env
+EnvironmentFile=/etc/containers/systemd/supabase.env
+EnvironmentFile=/etc/containers/systemd/model-proxy.env
+EnvironmentFile=/etc/containers/systemd/abacus-proxy.env
+
+Environment=ENABLE_PROMPT_LOGGING=true
+Environment=ENABLE_RAW_RESPONSE_LOGGING=true
+Environment=PORT=8003
+Environment=MCP_PORT=9003
+
+Volume=/var/log/podman/abacus-proxy/prompts:/app/prompt_logs:Z
+Volume=/home/pwp/srv/apps/abacus-proxy/src:/app/src:Z
+
+HealthCmd=curl -fsS http://127.0.0.1:8003/health
+HealthInterval=30s
+HealthTimeout=10s
+HealthRetries=7
+HealthStartPeriod=60s
+
+[Service]
+Restart=no
+RestartSec=10
+TimeoutStartSec=120s
+TimeoutStopSec=60s
+KillMode=mixed
+MemoryHigh=2G
+MemoryMax=3G
+CPUQuota=200%
+
+[Install]
+WantedBy=multi-user.target default.target

@@ -1,0 +1,208 @@
+# Generic Python Project Boilerplate - FastAPI Edition
+# Optimized for FastAPI/MCP projects with modular dependencies
+
+[project]
+name = "abacus-proxy"
+version = "0.1.0"
+description = "An intelligent proxy for RouteLLM that optimizes model selection, tracks usage, and manages context with Context Portal and Mem0."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    { name = "Paul Peterson", email = "paulwpeterson37@gmail.com" }
+]
+license = { text = "MIT" }
+
+# MINIMAL CORE: Only truly universal dependencies
+dependencies = [
+    "loguru>=0.7.0",           # Better logging
+    "rich>=13.0.0",            # Beautiful terminal output
+    "pyyaml>=6.0.0",           # YAML config files
+    "python-dotenv>=1.0.0",    # Environment variables
+    "pydantic>=2.0.0",         # Data validation / settings (AppConfig)
+    "fastmcp>=0.1.0",          # FastMCP server framework
+]
+
+[project.optional-dependencies]
+# Development tools - always install with --extra dev
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+    "pre-commit>=3.0.0",
+]
+
+# MCP server functionality
+mcp = [
+    "mcp>=1.0.0",
+    "websockets>=12.0",
+]
+
+# Mem0 ("mem-zero") memory layer + token estimation (optional but required for the new Mem0 features)
+memory = [
+    "mem0ai>=1.0.0",
+    "litellm>=1.0.0",
+    "tiktoken>=0.5.0",
+    "openai>=1.0.0",
+    "qdrant-client>=1.6.0",
+    "chromadb>=0.4.0",
+    "tenacity>=8.0.0",
+]
+
+# MCP Crawl4ai-rag functionality
+crawl4ai = [
+    "crawl4ai==0.6.2",
+    "mcp==1.7.1",
+    "supabase==2.15.1",
+    "openai==1.71.0",
+    "python-dotenv>=1.0.0",
+    "sentence-transformers>=4.1.0",
+    "neo4j>=5.28.1",
+]
+
+# Web API with FastAPI
+web = [
+    "fastapi>=0.112.0",
+    "uvicorn[standard]>=0.30.0",
+    "httpx>=0.28.1",
+    "websockets>=12.0",
+]
+
+# Database support
+db = [
+    "sqlalchemy>=2.0.0",
+    "alembic>=1.12.0",
+    "psycopg2-binary>=2.9.0",  # PostgreSQL
+]
+
+# AI/ML integration
+ai = [
+    "openai>=1.0.0",
+    "anthropic>=0.18.0",
+]
+
+# System monitoring
+monitoring = [
+    "psutil>=5.9.0",
+]
+
+# Async utilities
+async = [
+    "anyio>=4.0.0",
+    "aiofiles>=23.0.0",
+]
+
+# ALL: Install everything (for full-featured projects)
+all = [
+    "mcp>=1.0.0",
+    "websockets>=12.0",
+    "fastapi>=0.112.0",
+    "uvicorn[standard]>=0.30.0",
+    "httpx>=0.28.1",
+    "sqlalchemy>=2.0.0",
+    "alembic>=1.12.0",
+    "psycopg2-binary>=2.9.0",
+    "openai>=1.0.0",
+    "anthropic>=0.18.0",
+    "psutil>=5.9.0",
+    "anyio>=4.0.0",
+    "aiofiles>=23.0.0",
+    "mem0ai>=1.0.0",
+    "litellm>=1.0.0",
+    "tiktoken>=0.5.0",
+    "qdrant-client>=1.6.0",
+    "chromadb>=0.4.0",
+    "tenacity>=8.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/your_package"]  # Adjust to your package location
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]
+ignore = []
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra -q"
+testpaths = ["test"]
+asyncio_mode = "auto"
+
+# ============================================================================
+# USAGE GUIDE: How to handle "All dependencies in core"
+# ============================================================================
+#
+# OPTION 1: Minimal Core (RECOMMENDED for most projects)
+# --------------------------------------------------------
+# Keep only loguru, rich, pyyaml, python-dotenv in core dependencies.
+# Install extras as needed:
+#   uv sync --extra dev --extra mcp --extra web
+#
+# Pros: Clean, only installs what you need
+# Cons: Must remember to specify extras
+##
+# OPTION 2: Move Common Extras to Core
+# --------------------------------------------------------
+# If you ALWAYS use certain features, move them to core dependencies:
+#
+# dependencies = [
+#     "loguru>=0.7.0",
+#     "rich>=13.0.0",
+#     "pyyaml>=6.0.0",
+#     "python-dotenv>=1.0.0",
+#     "mcp>=1.0.0",              # If always building MCP servers
+#     "fastapi>=0.112.0",        # If always building APIs
+#     "uvicorn[standard]>=0.30.0",
+#     "httpx>=0.28.1",
+# ]
+#
+# Pros: Simple 'uv sync' installs everything you typically need
+# Cons: Installs deps even for projects that don't need them
+#
+#
+# OPTION 3: Use 'all' Extra for Full Install
+# --------------------------------------------------------
+# Keep minimal core, but install everything with:
+#   uv sync --extra dev --extra all
+#
+# Pros: Flexibility - minimal by default, full-featured when needed
+# Cons: Two-step thinking (minimal vs full)
+#
+#
+# RECOMMENDATION FOR YOUR USE CASE:
+# --------------------------------------------------------
+# Since you want a boilerplate for NEW projects, use OPTION 2:
+# Move mcp, fastapi, uvicorn, httpx to core dependencies.
+# This gives you a "batteries included" starting point.
+# Remove unused deps later if a specific project doesn't need them.
+#
+# Example core for "typical project":
+# dependencies = [
+#     "loguru>=0.7.0",
+#     "rich>=13.0.0",
+#     "pyyaml>=6.0.0",
+#     "python-dotenv>=1.0.0",
+#     "mcp>=1.0.0",
+#     "fastapi>=0.112.0",
+#     "uvicorn[standard]>=0.30.0",
+#     "httpx>=0.28.1",
+#     "psutil>=5.9.0",
+# ]

@@ -1,0 +1,102 @@
+exclude: |
+  ^context_portal/alembic/|  # Skip database migration files
+  ^node_modules/|            # Skip JavaScript dependencies
+  ^\.venv/                   # Skip Python virtual environment
+
+repos:
+  # ============================================================================
+  # PROJECT-SPECIFIC HOOKS (from .pre-commit-config-local.yaml)
+  # ============================================================================
+  - repo: local
+    hooks:
+      - id: pre-commit-custom-hook
+        name: pre-commit-custom-hook
+        entry: python ./.pre-commit-custom-hook.py
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+
+  # Basic file hygiene and validation
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-toml
+      - id: check-added-large-files
+      - id: check-merge-conflict
+      - id: debug-statements
+
+  # Import organization
+  - repo: https://github.com/pycqa/isort
+    rev: 7.0.0
+    hooks:
+      - id: isort
+        args: ["--profile", "black"]
+
+  # Code formatting
+  - repo: https://github.com/psf/black
+    rev: 25.11.0
+    hooks:
+      - id: black
+
+  # Fast linting
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.5
+    hooks:
+      - id: ruff
+        args:
+          - "--fix"
+          - "--line-length=88"
+          - "--extend-ignore=E203,E501,E221,E231"
+
+  # Static type checking
+  - repo: https://github.com/RobertCraigie/pyright-python
+    rev: v1.1.407
+    hooks:
+      - id: pyright
+        additional_dependencies:
+          - loguru
+          - mcp>=1.16.0
+          - httpx>=0.28.1
+          - pyyaml>=6.0.0
+          - rich
+          - sqlalchemy
+          - alembic
+
+  # Vulture: dead code finder (manual)
+  - repo: https://github.com/jendrikseipp/vulture
+    rev: v2.14
+    hooks:
+      - id: vulture
+        args:
+          - "."
+          - "--exclude"
+          - ".venv,node_modules,context_portal/alembic/versions"
+          - "--min-confidence"
+          - "90"
+        additional_dependencies:
+          - vulture
+
+  # Refurb: modernize code (manual)
+  - repo: https://github.com/dosisod/refurb
+    rev: v2.2.0
+    hooks:
+      - id: refurb
+        files: ^([^/]+\.py|modules/.*\.py)$
+        exclude: ^(context_portal/|\.venv/|node_modules/)
+
+  # Bandit: security scanner on changed files
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.9.2
+    hooks:
+      - id: bandit
+        name: bandit (security scan)
+        args:
+          - --skip
+          - B101,B110,B112,B108
+          - --exclude
+          - tests/,context_portal/alembic/versions,.venv,node_modules

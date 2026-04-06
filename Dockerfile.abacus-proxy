@@ -1,0 +1,32 @@
+# Dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Move .venv OUTSIDE of /app so volume mounts can't shadow it
+ENV VIRTUAL_ENV=/opt/venv
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y curl procps && rm -rf /var/lib/apt/lists/*
+
+# Copy dependency files
+COPY pyproject.toml uv.lock README.md ./
+
+# Copy application code (quadlet may still volume-mount src/ for live updates)
+COPY src/ ./src/
+COPY modules/ ./modules/
+COPY utils/ ./utils/
+
+# Install dependencies (uv sync creates a local virtualenv)
+RUN pip install uv hatchling && uv sync --frozen --extra web && ls -la /opt/venv || ls -la /app/.venv
+
+RUN chmod -R 755 /opt/venv
+
+# Expose the port
+EXPOSE 8003
+
+# Run the FastAPI proxy (inside uv-managed venv)
+# Use HOST/PORT env vars so we can run multiple proxies side-by-side during migration.
+# Use `exec` so uvicorn becomes PID 1 and receives SIGTERM properly under Podman/systemd.
+CMD ["sh", "-c", "exec uv run --frozen --no-sync uvicorn src.main_fastapi:app --host \"${HOST:-0.0.0.0}\" --port \"${PORT:-8003}\""]
