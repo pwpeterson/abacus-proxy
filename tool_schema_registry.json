@@ -1,0 +1,170 @@
+{
+    "metadata": {
+        "version": "1.0.0",
+        "description": "Tool schema registry for abacus-proxy with context-aware filtering",
+        "updated_at": "2026-04-06T20:44:00Z"
+    },
+    "policy": {
+        "tool_categories": {
+            "file_operations": [
+                "read_file",
+                "write_file",
+                "edit_file",
+                "list_files",
+                "search_files",
+                "create_directory",
+                "move_file",
+                "get_file_info"
+            ],
+            "git_operations": [
+                "git_status",
+                "git_log",
+                "git_diff",
+                "git_add",
+                "git_commit",
+                "git_push",
+                "git_pull",
+                "git_branch",
+                "git_checkout"
+            ],
+            "code_analysis": [
+                "analyze_codebase",
+                "detect_code_smells",
+                "generate_code_review",
+                "suggest_refactoring",
+                "security_scan"
+            ],
+            "testing": [
+                "generate_tests",
+                "run_tests",
+                "generate_fixtures"
+            ],
+            "documentation": [
+                "generate_docstrings",
+                "generate_api_docs",
+                "explain_code"
+            ],
+            "memory_operations": [
+                "add_memory",
+                "search_memories",
+                "get_all_memories",
+                "delete_memory"
+            ],
+            "web_operations": [
+                "crawl_single_page",
+                "smart_crawl_url",
+                "perform_rag_query",
+                "search_code_examples"
+            ],
+            "command_execution": [
+                "execute_command",
+                "precommit",
+                "precommit_fix"
+            ]
+        },
+        "keyword_signals": {
+            "file_operations": [
+                "read",
+                "write",
+                "file",
+                "directory",
+                "folder",
+                "list",
+                "search",
+                "find",
+                "create",
+                "delete",
+                "move",
+                "rename"
+            ],
+            "git_operations": [
+                "git",
+                "commit",
+                "push",
+                "pull",
+                "branch",
+                "merge",
+                "checkout",
+                "status",
+                "diff",
+                "log",
+                "version control"
+            ],
+            "code_analysis": [
+                "analyze",
+                "review",
+                "refactor",
+                "smell",
+                "quality",
+                "security",
+                "vulnerability",
+                "performance"
+            ],
+            "testing": [
+                "test",
+                "unittest",
+                "pytest",
+                "fixture",
+                "mock",
+                "coverage"
+            ],
+            "documentation": [
+                "document",
+                "docstring",
+                "comment",
+                "explain",
+                "api doc",
+                "readme"
+            ],
+            "memory_operations": [
+                "remember",
+                "recall",
+                "memory",
+                "store",
+                "retrieve",
+                "context"
+            ],
+            "web_operations": [
+                "crawl",
+                "scrape",
+                "web",
+                "url",
+                "search",
+                "rag",
+                "documentation"
+            ],
+            "command_execution": [
+                "run",
+                "execute",
+                "command",
+                "shell",
+                "bash",
+                "script",
+                "precommit"
+            ]
+        },
+        "essential_tools": [
+            "read_file",
+            "write_file",
+            "list_files",
+            "execute_command"
+        ],
+        "tool_injection": {
+            "enabled": true,
+            "max_tools": 20,
+            "max_tokens": 5000,
+            "conservative_mode": true
+        },
+        "tool_filtering": {
+            "enabled": true,
+            "max_tools": 50
+        },
+        "denylist": {
+            "control_tools": [
+                "attempt_completion",
+                "ask_followup_question"
+            ]
+        }
+    },
+    "tools": {}
+}

@@ -30,6 +30,8 @@ from src.utils.memory_service import MemoryService
 from src.utils.prompt_guard import guard_chat_messages
 from src.utils.rules_prompt_injector import inject_retrieved_rules
 from src.utils.startup_indexer import auto_index_rules_on_startup
+from src.utils.tool_filter import ToolFilter
+from src.utils.tool_schema_registry import load_tool_schema_registry, select_registry_tools_for_injection
 
 StartupHook = Callable[[dict[str, Any]], Awaitable[None]]
 ShutdownHook = Callable[[], Awaitable[None]]
@@ -98,6 +100,20 @@ def create_app(
             logger.warning(f"Mem0 services disabled (init failed): {e}")
             app.state.memory_service = None
             app.state.context_manager = None
+
+        # Load tool schema registry (best-effort)
+        tool_registry = None
+        if bool(getattr(config, "enable_tool_registry", False)):
+            try:
+                registry_path = str(getattr(config, "tool_registry_path", "./tool_schema_registry.json"))
+                tool_registry = load_tool_schema_registry(registry_path)
+                app.state.tool_registry = tool_registry
+                logger.info(f"Tool schema registry loaded from {registry_path}")
+            except Exception as e:
+                logger.warning(f"Tool schema registry disabled (load failed): {e}")
+                app.state.tool_registry = None
+        else:
+            app.state.tool_registry = None
 
         if on_startup:
             await on_startup(
@@ -698,6 +714,46 @@ def create_app(
 
         # Prompt guard last (it may drop old messages; should run after condensation store).
         _apply_prompt_guard(payload)
+
+        # Tool registry: injection and filtering
+        tool_registry = getattr(app.state, "tool_registry", None)
+        if tool_registry is not None:
+            messages = payload.get("messages", [])
+            tools = payload.get("tools")
+            
+            # Server-side tool injection (when client omits tools)
+            if not tools and bool(getattr(config, "enable_tool_injection", False)):
+                max_tools = int(getattr(config, "tool_injection_max_tools", 20))
+                max_tool_tokens = int(getattr(config, "tool_injection_max_tokens", 5000))
+                
+                injected_tools = select_registry_tools_for_injection(
+                    registry=tool_registry,
+                    messages=messages,
+                    max_tools=max_tools,
+                    max_tool_tokens=max_tool_tokens,
+                )
+                
+                if injected_tools:
+                    payload["tools"] = injected_tools
+                    logger.info(f"Injected {len(injected_tools)} tools from registry")
+            
+            # Client-provided tools filtering (when client provides tools)
+            elif tools and isinstance(tools, list) and bool(getattr(config, "enable_tool_filtering", False)):
+                max_tools = int(getattr(config, "tool_filtering_max_tools", 50))
+                
+                filtered_tools, filter_stats = ToolFilter.filter_tools(
+                    tools=tools,
+                    messages=messages,
+                    max_tools=max_tools,
+                    enable_filtering=True,
+                )
+                
+                if filter_stats.get("filtered"):
+                    payload["tools"] = filtered_tools
+                    logger.info(
+                        f"Filtered tools: {filter_stats['original_count']} → {filter_stats['filtered_count']} "
+                        f"({filter_stats.get('reduction_percent', 0):.1f}% reduction)"
+                    )
 
         # Sanitize tool schemas for upstream compatibility.
         #

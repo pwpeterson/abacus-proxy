@@ -150,6 +150,21 @@ class AppConfig(BaseModel):
     code_jit_trivial_bypass: bool = Field(default=True)
 
     # ---------------------------------------------------------------------
+    # Tool Schema Registry (context-aware tool filtering/injection)
+    # ---------------------------------------------------------------------
+    enable_tool_registry: bool = Field(default=False)
+    tool_registry_path: str = Field(default="./tool_schema_registry.json")
+    
+    # Server-side tool injection (when client omits tools)
+    enable_tool_injection: bool = Field(default=False)
+    tool_injection_max_tools: int = Field(default=20, ge=1, le=100)
+    tool_injection_max_tokens: int = Field(default=5000, ge=100, le=50_000)
+    
+    # Client-side tool filtering (when client provides tools)
+    enable_tool_filtering: bool = Field(default=False)
+    tool_filtering_max_tools: int = Field(default=50, ge=1, le=200)
+
+    # ---------------------------------------------------------------------
     # MCP server
     # ---------------------------------------------------------------------
     enable_mcp: bool = Field(default=True)
