@@ -179,6 +179,41 @@ class AppConfig(BaseModel):
     tool_filtering_max_tools: int = Field(default=50, ge=1, le=200)
 
     # ---------------------------------------------------------------------
+    # Request Tracking (Supabase telemetry)
+    #
+    # Logs API requests/responses to Supabase for analyzing:
+    # - Intelligent routing effectiveness (value-index, use case detection)
+    # - Context condensation effectiveness (tokens saved)
+    # - Cost optimization and trends
+    # - Request payload transformations (debugging)
+    # ---------------------------------------------------------------------
+    enable_request_tracking: bool = Field(
+        default=False,
+        description="Enable request/response logging to Supabase"
+    )
+    
+    # Supabase connection (falls back to env vars if not provided)
+    supabase_url: str | None = Field(default=None)
+    supabase_service_role_key: str | None = Field(default=None)
+    
+    # Privacy controls
+    store_request_payloads: bool = Field(
+        default=False,
+        description="Store full request payloads (privacy sensitive)"
+    )
+    store_response_payloads: bool = Field(
+        default=False,
+        description="Store full response payloads (privacy sensitive)"
+    )
+    store_context_text: bool = Field(
+        default=False,
+        description="Store raw/condensed context text (privacy sensitive)"
+    )
+    
+    # HTTP timeout for telemetry writes (best-effort, never blocks requests)
+    request_tracking_timeout_seconds: float = Field(default=2.5, ge=0.5, le=10.0)
+
+    # ---------------------------------------------------------------------
     # MCP server
     # ---------------------------------------------------------------------
     enable_mcp: bool = Field(default=True)
