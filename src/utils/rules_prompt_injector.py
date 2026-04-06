@@ -18,7 +18,7 @@ from typing import Any
 from loguru import logger
 
 from src.utils.memory_service import MemoryService
-from src.utils.token_estimator import estimate_tokens_tiktoken
+from src.utils.token_estimator import estimate_tokens_by_provider
 
 
 def _is_trivial_query(messages: list[dict[str, Any]]) -> bool:
@@ -188,7 +188,7 @@ async def inject_retrieved_rules(
     for shard in candidates:
         if len(selected) >= max_shards:
             break
-        shard_tokens = estimate_tokens_tiktoken(shard, model=model_id, fallback=True)
+        shard_tokens = estimate_tokens_by_provider(shard, model_id)
         if used + shard_tokens > max_tokens:
             continue
         selected.append(shard)
@@ -199,7 +199,7 @@ async def inject_retrieved_rules(
         return messages, stats
 
     rules_block = _build_rules_block(selected)
-    rules_tokens = estimate_tokens_tiktoken(rules_block, model=model_id, fallback=True)
+    rules_tokens = estimate_tokens_by_provider(rules_block, model_id)
 
     # Inject as a system message at the front, but after any existing system message if present.
     new_messages = list(messages)

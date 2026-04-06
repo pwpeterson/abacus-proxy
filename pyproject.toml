@@ -56,7 +56,7 @@ crawl4ai = [
     "crawl4ai==0.6.2",
     "mcp==1.7.1",
     "supabase==2.15.1",
-    "openai==1.71.0",
+    "openai>=1.90.0",  # Updated to match memory extra requirement
     "python-dotenv>=1.0.0",
     "sentence-transformers>=4.1.0",
     "neo4j>=5.28.1",

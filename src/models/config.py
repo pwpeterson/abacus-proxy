@@ -88,6 +88,20 @@ class AppConfig(BaseModel):
     # Keep empty for defaults; override via env JSON parsing in config_loader.
     model_value_index_family_priors: dict[str, float] = Field(default_factory=dict)
 
+    # ---------------------------------------------------------------------
+    # Intelligent Model Routing (when model="route-llm")
+    #
+    # When enabled, abacus-proxy analyzes incoming requests and automatically
+    # selects the best model from RouteLLM's catalog based on:
+    # - Use case detection (coding, architecting, condensation)
+    # - Model value index (capability/cost ratio)
+    # - Capability gates (context length, max tokens, thinking support)
+    # ---------------------------------------------------------------------
+    enable_intelligent_routing: bool = Field(
+        default=True,
+        description="Enable intelligent model selection when model='route-llm'"
+    )
+
     # Force upstream connections to use a specific local bind address.
     # This is useful when IPv6 connectivity is broken (e.g., upstream has AAAA records
     # but outbound IPv6 cannot reach :443). Setting this to "0.0.0.0" forces IPv4.

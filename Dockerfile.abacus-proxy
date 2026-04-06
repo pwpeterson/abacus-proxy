@@ -19,7 +19,8 @@ COPY modules/ ./modules/
 COPY utils/ ./utils/
 
 # Install dependencies (uv sync creates a local virtualenv)
-RUN pip install uv hatchling && uv sync --frozen --extra web && ls -la /opt/venv || ls -la /app/.venv
+# Include memory extra for Mem0 integration (mem0ai, qdrant-client, etc.)
+RUN pip install uv hatchling && uv sync --frozen --extra web --extra memory && ls -la /opt/venv || ls -la /app/.venv
 
 RUN chmod -R 755 /opt/venv
 

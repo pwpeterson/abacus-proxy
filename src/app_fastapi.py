@@ -686,6 +686,190 @@ def create_app(
         except httpx.HTTPError as e:
             raise HTTPException(status_code=502, detail=f"Upstream error: {e}") from e
 
+    async def _select_best_model(
+        payload: dict[str, Any],
+        *,
+        config: AppConfig,
+    ) -> str:
+        """Select best model from RouteLLM catalog based on request characteristics.
+        
+        This function implements intelligent model routing by:
+        1. Fetching the enriched models catalog from upstream
+        2. Detecting the use case from request characteristics
+        3. Filtering eligible models for that use case
+        4. Selecting the model with the highest value index
+        
+        Returns:
+            Model ID to use for the upstream request
+        """
+        from src.utils.model_value_index import (
+            ValueIndexConfig,
+            enrich_abacus_models,
+        )
+        
+        # Fetch models catalog (use cache if available)
+        cache = getattr(app.state, "models_cache", {"ts": 0.0, "data": None})
+        cache_ttl_s = 60.0
+        now = time.monotonic()
+        
+        models_data = None
+        if cache.get("data") is not None and (now - float(cache.get("ts", 0.0))) < cache_ttl_s:
+            models_data = cache["data"]
+        else:
+            # Fetch from upstream
+            api_base = _normalize_api_base_url(config.routellm_api_base_url)
+            url = f"{api_base}/models"
+            headers = _get_upstream_headers()
+            
+            try:
+                transport = _get_upstream_transport()
+                async with httpx.AsyncClient(timeout=20.0, transport=transport) as client:
+                    r = await client.get(url, headers=headers)
+                
+                if r.status_code == 200:
+                    models_data = r.json()
+                    cache["ts"] = now
+                    cache["data"] = models_data
+                    app.state.models_cache = cache
+            except Exception as e:
+                logger.warning(f"Failed to fetch models for intelligent routing: {e}")
+        
+        if not models_data or not isinstance(models_data, dict):
+            # Fallback to default if catalog unavailable
+            fallback = getattr(config, "route_default_target_model", "gpt-5.2") or "gpt-5.2"
+            logger.warning(f"Models catalog unavailable, using fallback: {fallback}")
+            return fallback
+        
+        # Enrich models with value indexes
+        vi_cfg = ValueIndexConfig(
+            family_quality_priors=dict(getattr(config, "model_value_index_family_priors", {}) or {}),
+            missing_thinking_penalty=float(
+                getattr(config, "model_value_index_missing_thinking_penalty", 0.10) or 0.10
+            ),
+        )
+        enriched = enrich_abacus_models(
+            models_data,
+            cfg=vi_cfg,
+            exclude_router_models=True,
+        )
+        
+        # Detect use case from request
+        use_case = _detect_use_case(payload)
+        
+        # Filter eligible models for this use case
+        models = enriched.get("data", [])
+        eligible_models = []
+        
+        for m in models:
+            if not isinstance(m, dict):
+                continue
+            
+            ap = m.get("abacus_proxy")
+            if not isinstance(ap, dict):
+                continue
+            
+            ucs = ap.get("use_cases", {})
+            if not isinstance(ucs, dict):
+                continue
+            
+            uc_data = ucs.get(use_case)
+            if not isinstance(uc_data, dict):
+                continue
+            
+            if uc_data.get("eligible"):
+                eligible_models.append({
+                    "id": m.get("id"),
+                    "index": float(uc_data.get("index", 0.0)),
+                    "capability": float(uc_data.get("capability", 0.0)),
+                    "job_cost": float(uc_data.get("job_cost", 0.0)),
+                })
+        
+        if not eligible_models:
+            fallback = getattr(config, "route_default_target_model", "gpt-5.2") or "gpt-5.2"
+            logger.warning(
+                f"No eligible models for use_case={use_case}, using fallback: {fallback}"
+            )
+            return fallback
+        
+        # Sort by value index (highest first)
+        eligible_models.sort(key=lambda m: m["index"], reverse=True)
+        
+        selected = eligible_models[0]
+        logger.info(
+            f"Intelligent routing: use_case={use_case} selected={selected['id']} "
+            f"index={selected['index']:.1f} capability={selected['capability']:.3f} "
+            f"cost=${selected['job_cost']:.6f}"
+        )
+        
+        return str(selected["id"])
+    
+    def _detect_use_case(payload: dict[str, Any]) -> str:
+        """Detect use case from request characteristics.
+        
+        Returns:
+            One of: "coding", "architecting", "condensation"
+        """
+        messages = payload.get("messages", [])
+        tools = payload.get("tools", [])
+        
+        # Calculate total input size
+        total_chars = 0
+        for m in messages:
+            if isinstance(m, dict):
+                content = m.get("content", "")
+                if isinstance(content, str):
+                    total_chars += len(content)
+                elif isinstance(content, list):
+                    # Handle multi-modal content
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "text":
+                            total_chars += len(str(item.get("text", "")))
+        
+        # Large context = condensation use case
+        if total_chars > 30000:
+            return "condensation"
+        
+        # Check for coding indicators
+        coding_keywords = [
+            "code", "implement", "function", "class", "debug", "refactor",
+            "bug", "error", "fix", "test", "api", "endpoint", "database",
+            "query", "algorithm", "data structure", "variable", "method",
+            "import", "export", "module", "package", "library", "framework",
+        ]
+        
+        # Tools present suggests coding/implementation work
+        if tools and isinstance(tools, list) and len(tools) > 0:
+            return "coding"
+        
+        # Check message content for coding keywords
+        content_lower = ""
+        for m in messages:
+            if isinstance(m, dict):
+                content = m.get("content", "")
+                if isinstance(content, str):
+                    content_lower += content.lower() + " "
+        
+        coding_score = sum(1 for kw in coding_keywords if kw in content_lower)
+        
+        # High coding keyword density = coding use case
+        if coding_score >= 3:
+            return "coding"
+        
+        # Check for architecture/planning keywords
+        arch_keywords = [
+            "design", "architecture", "plan", "strategy", "approach",
+            "system", "component", "module", "structure", "pattern",
+            "workflow", "process", "integration", "scalability",
+        ]
+        
+        arch_score = sum(1 for kw in arch_keywords if kw in content_lower)
+        
+        if arch_score >= 2:
+            return "architecting"
+        
+        # Default to coding for ambiguous cases (most common in Roo)
+        return "coding"
+    
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):  # type: ignore[reportUnusedFunction]
         """OpenAI-compatible chat completions endpoint.
@@ -694,7 +878,7 @@ def create_app(
         This proxy forwards the request to the configured RouteLLM upstream.
 
         Important:
-        - The upstream model is forced to `config.routellm_model_id`.
+        - When model="route-llm", intelligent model selection is performed
         - Streaming is supported via pass-through when `stream=true`.
         """
         api_base = _normalize_api_base_url(config.routellm_api_base_url)
@@ -811,9 +995,13 @@ def create_app(
         aliases = getattr(config, "model_aliases", {}) or {}
         upstream_model = aliases.get(requested_model, requested_model)
 
-        # Safety: never forward to route-llm itself unless explicitly desired.
+        # Intelligent model selection when route-llm is requested
         if upstream_model == "route-llm":
-            upstream_model = getattr(config, "route_default_target_model", "gpt-5.2") or "gpt-5.2"
+            if bool(getattr(config, "enable_intelligent_routing", True)):
+                upstream_model = await _select_best_model(payload, config=config)
+            else:
+                # Fallback to configured default
+                upstream_model = getattr(config, "route_default_target_model", "gpt-5.2") or "gpt-5.2"
 
         if upstream_model != requested_model:
             logger.info(f"Model alias: requested={requested_model} -> upstream={upstream_model}")
