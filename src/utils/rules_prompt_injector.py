@@ -1,14 +1,12 @@
 """Mem0-backed `.roo` rules retrieval and compact injection.
 
-Ported/adapted from model-proxy.
-
-This retrieves a small number of relevant "roo_rule_shard" memories and injects them
+This module retrieves a small number of relevant "roo_rule_shard" memories and injects them
 into the request as a compact system message block, with a strict token budget.
 
-Important:
-- This does NOT remove an existing large system prompt. It's a migration helper.
-- For best results, configure the client to send a minimal system prompt and rely
-  on Mem0-retrieved shards + local rules.
+Important: This does NOT remove Roo Code's original system prompt. It only adds a compact
+"Rules (retrieved)" block. The full prompt bloat problem is ultimately solved by configuring
+Roo Code to send a minimal system prompt, but this module enables a migration path where
+rules can be externalized into Mem0 and selectively re-injected.
 """
 
 from __future__ import annotations
@@ -20,14 +18,15 @@ from typing import Any
 from loguru import logger
 
 from src.utils.memory_service import MemoryService
-from src.utils.token_estimator import estimate_tokens_by_provider
+from src.utils.token_estimator import estimate_tokens_tiktoken
 
 
 def _is_trivial_query(messages: list[dict[str, Any]]) -> bool:
     """Heuristic: treat short, non-technical user queries as trivial."""
-    last_user: Any = None
+    # Find last user message
+    last_user = None
     for msg in reversed(messages):
-        if isinstance(msg, dict) and msg.get("role") == "user":
+        if msg.get("role") == "user":
             last_user = msg.get("content", "")
             break
 
@@ -38,9 +37,11 @@ def _is_trivial_query(messages: list[dict[str, Any]]) -> bool:
     if len(text) == 0:
         return True
 
+    # Very short questions like "2+2" or "hi"
     if len(text) <= 20:
         return True
 
+    # If it looks like code/tools/debugging, not trivial
     technical_markers = [
         "traceback",
         "exception",
@@ -55,8 +56,8 @@ def _is_trivial_query(messages: list[dict[str, Any]]) -> bool:
         "def ",
         "const ",
         "let ",
-        "select ",
-        "insert ",
+        "SELECT ",
+        "INSERT ",
         "docker",
         "kubernetes",
         "mcp",
@@ -71,9 +72,11 @@ def _is_trivial_query(messages: list[dict[str, Any]]) -> bool:
     if any(m in lower for m in technical_markers):
         return False
 
+    # If it contains a file path-ish token, not trivial
     if re.search(r"[/\\][\w\-. /\\]+\.\w{1,6}\b", text):
         return False
 
+    # Otherwise treat as trivial if it's short-ish
     return len(text) <= 80
 
 
@@ -94,6 +97,8 @@ def _extract_shard_body(memory_text: str) -> str:
     """Strip the RULE_SHARD header if present."""
     if not isinstance(memory_text, str):
         return ""
+
+    # If it contains a blank line after header, keep only body after first blank line.
     parts = memory_text.split("\n\n", 1)
     if len(parts) == 2 and parts[0].startswith("RULE_SHARD"):
         return parts[1].strip()
@@ -136,6 +141,7 @@ async def inject_retrieved_rules(
         stats["skipped_reason"] = "trivial_bypass"
         return messages, stats
 
+    # Build query from last user message (best-effort)
     query = ""
     for msg in reversed(messages):
         if msg.get("role") == "user" and isinstance(msg.get("content"), str):
@@ -146,25 +152,23 @@ async def inject_retrieved_rules(
         stats["skipped_reason"] = "no_user_query"
         return messages, stats
 
-    # Bias search toward rule shards
+    # Search for relevant rule shards. We rely on the shard header + metadata to bias results.
+    # Note: MemoryService.search_memory supports project_id filtering.
     search_query = f"roo rules {query}"
+    # Offload blocking mem0/Qdrant search to thread pool to avoid stalling the event loop
+    res = await asyncio.to_thread(
+        memory_service.search_memory,
+        query=search_query[:500],
+        user_id=user_id,
+        project_id=project_id,
+        limit=max(1, max_shards * 3),
+    )
 
-    try:
-        res = await asyncio.to_thread(
-            memory_service.search_memory,
-            query=search_query[:500],
-            user_id=user_id,
-            project_id=project_id,
-            limit=max(1, max_shards * 3),
-        )
-    except Exception as e:
-        stats["skipped_reason"] = f"search_error:{e}"
-        return messages, stats
-
-    if not getattr(res, "results", None):
+    if not res.results:
         stats["skipped_reason"] = "no_results"
         return messages, stats
 
+    # Filter to only rule shards
     candidates: list[str] = []
     for item in res.results:
         md = item.metadata or {}
@@ -178,12 +182,13 @@ async def inject_retrieved_rules(
         stats["skipped_reason"] = "no_rule_shards"
         return messages, stats
 
+    # Enforce token budget
     selected: list[str] = []
     used = 0
     for shard in candidates:
         if len(selected) >= max_shards:
             break
-        shard_tokens = estimate_tokens_by_provider(shard, model_id)
+        shard_tokens = estimate_tokens_tiktoken(shard, model=model_id, fallback=True)
         if used + shard_tokens > max_tokens:
             continue
         selected.append(shard)
@@ -194,19 +199,27 @@ async def inject_retrieved_rules(
         return messages, stats
 
     rules_block = _build_rules_block(selected)
-    rules_tokens = estimate_tokens_by_provider(rules_block, model_id)
+    rules_tokens = estimate_tokens_tiktoken(rules_block, model=model_id, fallback=True)
 
+    # Inject as a system message at the front, but after any existing system message if present.
     new_messages = list(messages)
+
     insert_at = 0
     if new_messages and new_messages[0].get("role") == "system":
         insert_at = 1
+
     new_messages.insert(insert_at, {"role": "system", "content": rules_block})
 
-    stats.update({"injected": True, "retrieved": len(selected), "tokens_used": rules_tokens})
+    stats.update(
+        {
+            "injected": True,
+            "retrieved": len(selected),
+            "tokens_used": rules_tokens,
+        }
+    )
 
     logger.debug(
-        f"Injected {len(selected)} rule shards (~{rules_tokens} tokens) "
-        f"user_id={user_id}, project_id={project_id}"
+        f"Injected {len(selected)} rule shards (~{rules_tokens} tokens) for user_id={user_id}, project_id={project_id}"
     )
 
     return new_messages, stats

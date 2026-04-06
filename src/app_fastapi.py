@@ -88,16 +88,7 @@ def create_app(
                 # Offload to a thread: indexing may do I/O and embeddings.
                 idx_result = await asyncio.to_thread(
                     auto_index_rules_on_startup,
-                    memory_service=memory_service,
-                    enabled=bool(getattr(config, "auto_index_rules_on_startup", False)),
-                    interval_hours=int(getattr(config, "auto_index_interval_hours", 24)),
-                    state_dir_override=getattr(config, "auto_index_state_dir", None),
-                    user_id=str(getattr(config, "rules_memory_user_id", "system") or "system"),
-                    project_id=str(
-                        getattr(config, "rules_memory_project_id", "roo_rules") or "roo_rules"
-                    ),
-                    max_chars=int(getattr(config, "auto_index_max_chars", 1200)),
-                    overlap_chars=int(getattr(config, "auto_index_overlap_chars", 150)),
+                    memory_service,
                 )
                 logger.bind(**{f"rules_index_{k}": v for k, v in idx_result.items()}).info(
                     "Rules auto-index completed"
