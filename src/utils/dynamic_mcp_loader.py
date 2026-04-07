@@ -22,6 +22,8 @@ class DynamicMCPLoader:
         self.project_config_path = Path(".roo/mcp.json")
         self._merged_servers: dict[str, dict[str, Any]] = {}
         self._server_list: list[str] = []
+        # Servers to exclude from discovery
+        self.excluded_servers = ["model-proxy"]  # Exclude to avoid circular dependency
         
     def load_all_servers(self) -> dict[str, dict[str, Any]]:
         """Load and merge all MCP server configurations.
@@ -34,12 +36,16 @@ class DynamicMCPLoader:
         # Load global servers first
         global_servers = self._load_global_servers()
         if global_servers:
+            # Filter out excluded servers
+            global_servers = {k: v for k, v in global_servers.items() if k not in self.excluded_servers}
             all_servers.update(global_servers)
             logger.info(f"Loaded {len(global_servers)} global MCP servers")
         
         # Load project servers (override global)
         project_servers = self._load_project_servers()
         if project_servers:
+            # Filter out excluded servers
+            project_servers = {k: v for k, v in project_servers.items() if k not in self.excluded_servers}
             all_servers.update(project_servers)
             logger.info(f"Loaded {len(project_servers)} project MCP servers")
         

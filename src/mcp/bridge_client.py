@@ -828,7 +828,7 @@ async def list_tools_for_server(server: str) -> list[dict[str, Any]]:
     bridge = _get_bridge_config(cfg)
     policy = _merge_policy(bridge, server)
 
-    timeout_s = _get_int(policy, "timeout_ms", 30000) / 1000.0
+    timeout_s = _get_int(policy, "timeout_ms", 60000) / 1000.0
     connect_timeout_s = _get_int(policy, "connect_timeout_ms", 5000) / 1000.0
     max_concurrent = _get_int(policy, "max_concurrent", 1)
 
@@ -900,7 +900,7 @@ async def call_tool_on_server(server: str, tool: str, arguments: dict[str, Any])
     bridge = _get_bridge_config(cfg)
     policy = _merge_policy(bridge, server)
 
-    timeout_s = _get_int(policy, "timeout_ms", 30000) / 1000.0
+    timeout_s = _get_int(policy, "timeout_ms", 60000) / 1000.0
     connect_timeout_s = _get_int(policy, "connect_timeout_ms", 5000) / 1000.0
     max_concurrent = _get_int(policy, "max_concurrent", 1)
 
