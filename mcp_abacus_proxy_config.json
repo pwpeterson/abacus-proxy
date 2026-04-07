@@ -23,11 +23,14 @@
   },
   "conport": {
     "type": "stdio",
-    "command": "uvx",
+    "command": "uv",
     "args": [
-      "--from",
-      "context-portal-mcp",
-      "conport-mcp",
+      "run",
+      "--directory",
+      "/home/pwp/srv/context-portal",
+      "python",
+      "-m",
+      "context_portal_mcp.main",
       "--mode",
       "stdio",
       "--workspace_id",
