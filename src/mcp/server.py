@@ -27,6 +27,9 @@ from src.mcp.errors import MCPToolError
 from src.mcp.tools import (
     get_model_proxy_url,
     list_available_models,
+    mcp_call,
+    mcp_list_servers,
+    mcp_list_tools,
     send_chat_request,
     stream_chat_request,
 )
@@ -138,6 +141,54 @@ class MCPServer:
                 "name": "get_model_proxy_url",
                 "description": "Get the current ABACUS_PROXY_URL (or MODEL_PROXY_URL fallback)",
                 "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+            "mcp_list_servers": {
+                "name": "mcp_list_servers",
+                "description": "List MCP servers configured/allowlisted for the MCP bridge (no secrets)",
+                "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+            "mcp_list_tools": {
+                "name": "mcp_list_tools",
+                "description": "List tools available on a configured external MCP server (bridge discovery)",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "server": {
+                            "type": "string",
+                            "description": "MCP server name",
+                        },
+                    },
+                    "required": ["server"],
+                    "additionalProperties": False,
+                },
+            },
+            "mcp_call": {
+                "name": "mcp_call",
+                "description": "Call a tool on a configured external MCP server (generic bridge)",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "server": {
+                            "type": "string",
+                            "description": "MCP server name (required if tool_ref not provided)",
+                        },
+                        "tool": {
+                            "type": "string",
+                            "description": "Tool name on the target MCP server (required if tool_ref not provided)",
+                        },
+                        "tool_ref": {
+                            "type": "string",
+                            "description": "Optional shorthand: 'server/tool' (if provided, server/tool can be omitted)",
+                        },
+                        "arguments": {
+                            "type": "object",
+                            "description": "Tool arguments payload (JSON object)",
+                            "default": {},
+                        },
+                    },
+                    "required": ["arguments"],
+                    "additionalProperties": False,
+                },
             },
         }
 
@@ -315,6 +366,12 @@ class MCPServer:
                 result = await list_available_models(self.app_resources, arguments)
             elif tool_name == "get_model_proxy_url":
                 result = await get_model_proxy_url(self.app_resources, arguments)
+            elif tool_name == "mcp_list_servers":
+                result = await mcp_list_servers(self.app_resources, arguments)
+            elif tool_name == "mcp_list_tools":
+                result = await mcp_list_tools(self.app_resources, arguments)
+            elif tool_name == "mcp_call":
+                result = await mcp_call(self.app_resources, arguments)
             else:
                 return {
                     "jsonrpc": "2.0",

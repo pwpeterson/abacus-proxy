@@ -20,6 +20,8 @@ Environment=MCP_PORT=9003
 
 Volume=/var/log/podman/abacus-proxy/prompts:/app/prompt_logs:Z
 Volume=/home/pwp/srv/apps/abacus-proxy/src:/app/src:Z
+Volume=/home/pwp/srv/apps/abacus-proxy/.roo:/app/.roo:Z
+Volume=/home/pwp/.vscode-server/data/User/globalStorage/rooveterinaryinc.roo-cline/settings:/root/.vscode-server/data/User/globalStorage/rooveterinaryinc.roo-cline/settings:Z
 
 HealthCmd=curl -fsS http://127.0.0.1:8003/health
 HealthInterval=30s

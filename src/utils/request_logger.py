@@ -67,6 +67,7 @@ class AbacusRequestLogger:
             supabase_service_role_key
             or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
             or os.getenv("SERVICE_ROLE_KEY")
+            or os.getenv("SUPABASE_SERVICE_KEY")  # Added: common in Supabase self-hosted setups
             or os.getenv("SUPABASE_KEY")
             or ""
         ).strip()

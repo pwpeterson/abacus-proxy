@@ -1,0 +1,133 @@
+{
+  "mcp_bridge": {
+    "enabled": true,
+    "server_allowlist": [
+      "mindscape-ai",
+      "mem0-mcp",
+      "conport",
+      "mcp-git-tools"
+    ],
+    "defaults": {
+      "enabled": true,
+      "timeout_ms": 30000,
+      "connect_timeout_ms": 5000,
+      "max_concurrent": 5,
+      "deny_by_default": false,
+      "allowed_tools": [
+        "*"
+      ],
+      "denied_tools": [],
+      "allowed_transports": [
+        "sse",
+        "stdio"
+      ]
+    },
+    "servers": {
+      "conport": {
+        "enabled": true,
+        "timeout_ms": 180000
+      }
+    },
+    "schema_validation": {
+      "enabled": true,
+      "source_precedence": [
+        "live_tools_list_cache",
+        "registry_if_unambiguous"
+      ],
+      "live_cache_ttl_seconds": 300
+    },
+    "hygiene": {
+      "enabled": true,
+      "max_output_chars": 20000
+    },
+    "audit": {
+      "enabled": true,
+      "log_arguments": true,
+      "redact_keys": [
+        "password",
+        "token",
+        "key",
+        "secret",
+        "api_key",
+        "apikey"
+      ],
+      "max_arg_chars": 2000
+    }
+  },
+  "mindscape-ai": {
+    "type": "stdio",
+    "command": "/bin/bash",
+    "args": [
+      "-lc",
+      "set -euo pipefail; cd /home/pwp/srv/apps/mindscape-ai; set -a; source <(grep -E '^(SUPABASE_URL|SUPABASE_PUBLIC_URL|API_EXTERNAL_URL|SUPABASE_SERVICE_ROLE_KEY|SERVICE_ROLE_KEY|SERVICE_KEY)=' ./supabase.env); set +a; export SUPABASE_URL=\"${SUPABASE_PUBLIC_URL:-${API_EXTERNAL_URL:-${SUPABASE_URL:-http://localhost:8000}}}\"; export SUPABASE_SERVICE_ROLE_KEY=\"${SUPABASE_SERVICE_ROLE_KEY:-${SERVICE_ROLE_KEY:-${SERVICE_KEY:-}}}\"; exec /home/pwp/.local/bin/uv run --directory /home/pwp/srv/apps/mindscape-ai python -m mindscape_ai.mcp_server"
+    ],
+    "description": "mindscape-ai MCP server",
+    "env": {
+      "MINDSCAPE_MCP_APP_ID": "${workspaceFolderBasename}",
+      "MINDSCAPE_MCP_DB": "context_portal/context.db",
+      "MINDSCAPE_MCP_USER_ID": "default",
+      "MINDSCAPE_MCP_PROJECT_ID": "",
+      "MINDSCAPE_MCP_PROMPTS_MAX_FILE_BYTES": "200000",
+      "MINDSCAPE_APPS_WRITE": "true"
+    }
+  },
+  "mem0-mcp": {
+    "type": "stdio",
+    "command": "uv",
+    "args": [
+      "run",
+      "--directory",
+      "/home/pwp/srv/mcps/mem0-mcp",
+      "python",
+      "-m",
+      "mem0_mcp.server"
+    ],
+    "description": "mem0-mcp MCP server",
+    "env": {
+      "MEM0_QDRANT_HOST": "localhost",
+      "MEM0_DEFAULT_APP_ID": "${workspaceFolderBasename}"
+    }
+  },
+  "conport": {
+    "type": "stdio",
+    "command": "uv",
+    "args": [
+      "run",
+      "--directory",
+      "/home/pwp/srv/context-portal",
+      "python",
+      "-m",
+      "context_portal_mcp.main",
+      "--mode",
+      "stdio",
+      "--workspace_id",
+      "/home/pwp/srv/apps/abacus-proxy",
+      "--db-path",
+      "context_portal/context.db",
+      "--workspace-search-start",
+      ".",
+      "--log-file",
+      "context_portal/logs/conport.log",
+      "--log-level",
+      "DEBUG"
+    ],
+    "description": "conport MCP server"
+  },
+  "mcp-git-tools": {
+    "type": "stdio",
+    "command": "uv",
+    "args": [
+      "--directory",
+      "/home/pwp/srv/mcps/mcp-git-tools",
+      "run",
+      "python",
+      "mcp-git-tools.py",
+      "--workspace_id",
+      "/home/pwp/srv/apps/abacus-proxy"
+    ],
+    "description": "Comprehensive Git operations with 49 tools covering Advanced Operations, Basic Operations, Branch Operations, File Operations, File Recovery Operations, Github Operations, Llm Operations, Remote Operations, Repo Info, Stash Operations, Tool Info, Validation Operations",
+    "env": {
+      "MODEL_PROXY_URL": "http://localhost:8002"
+    }
+  }
+}

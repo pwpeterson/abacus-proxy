@@ -207,6 +207,22 @@ def load_app_config() -> AppConfig:
             "ROUTELLM_KEY",
             "RouteLLM_KEY",
         ),
+        # Tool Schema Registry
+        enable_tool_registry=os.getenv("ENABLE_TOOL_REGISTRY", "false").lower() == "true",
+        tool_registry_path=os.getenv("TOOL_REGISTRY_PATH", "./tool_schema_registry.json"),
+        enable_tool_injection=os.getenv("ENABLE_TOOL_INJECTION", "false").lower() == "true",
+        tool_injection_max_tools=int(os.getenv("TOOL_INJECTION_MAX_TOOLS", "20")),
+        tool_injection_max_tokens=int(os.getenv("TOOL_INJECTION_MAX_TOKENS", "5000")),
+        enable_tool_filtering=os.getenv("ENABLE_TOOL_FILTERING", "false").lower() == "true",
+        tool_filtering_max_tools=int(os.getenv("TOOL_FILTERING_MAX_TOOLS", "50")),
+        # Request Tracking (Supabase telemetry)
+        enable_request_tracking=os.getenv("ENABLE_REQUEST_TRACKING", "false").lower() == "true",
+        supabase_url=os.getenv("SUPABASE_URL") or None,
+        supabase_service_role_key=os.getenv("SUPABASE_SERVICE_ROLE_KEY") or None,
+        store_request_payloads=os.getenv("STORE_REQUEST_PAYLOADS", "false").lower() == "true",
+        store_response_payloads=os.getenv("STORE_RESPONSE_PAYLOADS", "false").lower() == "true",
+        store_context_text=os.getenv("STORE_CONTEXT_TEXT", "false").lower() == "true",
+        request_tracking_timeout_seconds=float(os.getenv("REQUEST_TRACKING_TIMEOUT_SECONDS", "2.5")),
         # MCP server
         enable_mcp=os.getenv("ENABLE_MCP", "true").lower() == "true",
         mcp_host=os.getenv("MCP_HOST", "0.0.0.0"),

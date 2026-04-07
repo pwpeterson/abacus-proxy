@@ -7,13 +7,20 @@ Modeled after model-proxy's MCP surface, but with a single upstream:
 
 from __future__ import annotations
 
+import json
 import os
+import re
+import secrets
+import time
 import uuid
+from collections import Counter
+from pathlib import Path
 from typing import Any
 
 import httpx
 from loguru import logger
 
+from src.mcp.bridge_client import call_tool_on_server, list_tools_for_server
 from src.mcp.errors import MCPToolError
 from src.utils.code_jit_prompt_injector import inject_code_jit_context
 from src.utils.context_manager import ContextManager
@@ -376,3 +383,923 @@ async def get_model_proxy_url(
             os.getenv("MODEL_PROXY_URL", "http://localhost:8003"),
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# MCP Bridge Tools (from model-proxy)
+# ---------------------------------------------------------------------------
+
+from src.mcp.bridge_client import call_tool_on_server, list_tools_for_server
+
+def _load_abacus_proxy_mcp_config() -> dict[str, Any]:
+    """
+    Load the model-proxy MCP configuration file.
+
+    Default path: mcp_abacus_proxy_config.json
+    Optional override: MCP_ABACUS_PROXY_CONFIG_PATH env var
+    """
+    cfg_path = os.getenv("MCP_ABACUS_PROXY_CONFIG_PATH", "mcp_abacus_proxy_config.json")
+    p = Path(cfg_path)
+    if not p.exists():
+        raise MCPToolError(
+            -32603,
+            f"MCP config not found: {cfg_path}",
+            {"error_type": "config_error", "path": str(cfg_path)},
+        )
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise MCPToolError(
+            -32603,
+            f"Failed to parse MCP config: {cfg_path}",
+            {"error_type": "config_error", "path": str(cfg_path), "detail": str(e)},
+        ) from e
+
+    if not isinstance(data, dict):
+        raise MCPToolError(
+            -32603,
+            f"Invalid MCP config (expected object): {cfg_path}",
+            {"error_type": "config_error", "path": str(cfg_path)},
+        )
+
+    return data
+
+
+def _get_bridge_block(cfg: dict[str, Any]) -> dict[str, Any]:
+    bridge = cfg.get("mcp_bridge")
+    return bridge if isinstance(bridge, dict) else {}
+
+
+def _merge_server_policy(bridge: dict[str, Any], server: str) -> dict[str, Any]:
+    defaults = bridge.get("defaults")
+    if not isinstance(defaults, dict):
+        defaults = {}
+
+    servers = bridge.get("servers")
+    if not isinstance(servers, dict):
+        servers = {}
+
+    per = servers.get(server)
+    if not isinstance(per, dict):
+        per = {}
+
+    merged = dict(defaults)
+    merged.update(per)
+    return merged
+
+
+def _tool_matches_any(tool: str, patterns: list[Any]) -> bool:
+    # Supports exact match and "*" wildcard.
+    for p in patterns:
+        if p == "*":
+            return True
+        if isinstance(p, str) and p == tool:
+            return True
+    return False
+
+
+def _is_tool_allowed(bridge: dict[str, Any], server: str, tool: str) -> tuple[bool, str]:
+    """
+    Decide allow/deny based on mcp_bridge policy.
+
+    Return: (allowed, reason)
+    """
+    allowlist = bridge.get("server_allowlist")
+    if not isinstance(allowlist, list) or server not in allowlist:
+        return False, "server_not_allowlisted"
+
+    merged = _merge_server_policy(bridge, server)
+
+    if merged.get("enabled") is False:
+        return False, "server_disabled"
+
+    deny_by_default = bool(merged.get("deny_by_default", True))
+
+    allowed_tools = merged.get("allowed_tools")
+    if not isinstance(allowed_tools, list):
+        allowed_tools = []
+
+    denied_tools = merged.get("denied_tools")
+    if not isinstance(denied_tools, list):
+        denied_tools = []
+
+    # Deny list takes precedence
+    if _tool_matches_any(tool, denied_tools):
+        return False, "tool_denied"
+
+    # Allow list
+    if _tool_matches_any(tool, allowed_tools):
+        return True, "tool_allowed"
+
+    if deny_by_default:
+        return False, "deny_by_default"
+
+    return True, "default_allow"
+
+
+def _parse_tool_ref(tool_ref: str) -> tuple[str, str]:
+    if "/" not in tool_ref:
+        raise MCPToolError(
+            -32602,
+            "Invalid tool_ref: expected 'server/tool'",
+            {"error_type": "invalid_arguments", "tool_ref": tool_ref},
+        )
+    server, tool = tool_ref.split("/", 1)
+    server = server.strip()
+    tool = tool.strip()
+    if not server or not tool:
+        raise MCPToolError(
+            -32602,
+            "Invalid tool_ref: expected 'server/tool'",
+            {"error_type": "invalid_arguments", "tool_ref": tool_ref},
+        )
+    return server, tool
+
+
+def _get_schema_validation_block(bridge: dict[str, Any]) -> dict[str, Any]:
+    raw = bridge.get("schema_validation")
+    return raw if isinstance(raw, dict) else {}
+
+
+def _extract_mcp_input_schema(
+    *, tools: list[dict[str, Any]], tool_name: str
+) -> dict[str, Any] | None:
+    """Extract JSON schema for MCP tool arguments from tools/list response."""
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        if t.get("name") != tool_name:
+            continue
+        schema = t.get("inputSchema")
+        return schema if isinstance(schema, dict) else None
+    return None
+
+
+def _extract_openai_parameters_schema(tool_schema: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract JSON schema for arguments from an OpenAI tool schema dict."""
+    if not isinstance(tool_schema, dict):
+        return None
+    if tool_schema.get("type") != "function":
+        return None
+    fn = tool_schema.get("function")
+    if not isinstance(fn, dict):
+        return None
+    params = fn.get("parameters")
+    return params if isinstance(params, dict) else None
+
+
+def _ensure_openai_strict_object_schemas(schema: Any) -> Any:
+    """Post-process a JSON schema to satisfy OpenAI strict validation.
+
+    OpenAI (gpt-5.2+) requires that any schema with `"type": "object"` explicitly sets
+    `"additionalProperties": false` (not omitted, not true).
+
+    We apply this recursively to:
+    - the schema itself
+    - anyOf/oneOf/allOf branches
+    - properties values
+    - items (arrays)
+    - $defs/definitions
+
+    This is a *schema normalization* step only; it does not validate or coerce tool arguments.
+    """
+    if isinstance(schema, list):
+        return [_ensure_openai_strict_object_schemas(x) for x in schema]
+
+    if not isinstance(schema, dict):
+        return schema
+
+    # Recurse first (so we don't miss nested objects)
+    for key in ("anyOf", "oneOf", "allOf"):
+        if key in schema and isinstance(schema[key], list):
+            schema[key] = [_ensure_openai_strict_object_schemas(x) for x in schema[key]]
+
+    if "properties" in schema and isinstance(schema["properties"], dict):
+        schema["properties"] = {
+            k: _ensure_openai_strict_object_schemas(v) for k, v in schema["properties"].items()
+        }
+
+    if "items" in schema:
+        schema["items"] = _ensure_openai_strict_object_schemas(schema["items"])
+
+    for defs_key in ("$defs", "definitions"):
+        if defs_key in schema and isinstance(schema[defs_key], dict):
+            schema[defs_key] = {
+                k: _ensure_openai_strict_object_schemas(v) for k, v in schema[defs_key].items()
+            }
+
+    # Enforce OpenAI strictness for object schemas.
+    #
+    # IMPORTANT:
+    # Some MCP servers legitimately use `additionalProperties: true` (or omit it) to accept
+    # arbitrary argument objects (e.g. an "echo" tool for testing). Forcing `false` would
+    # break schema validation and reject valid calls.
+    #
+    # OpenAI strictness is only required when sending tool schemas *to OpenAI*; it should
+    # not be applied to MCP tool argument validation.
+    if schema.get("type") == "object" and "additionalProperties" not in schema:
+        schema["additionalProperties"] = False
+
+    return schema
+
+
+def _resolve_registry_schema_if_unambiguous(
+    *, server: str, tool_name: str
+) -> tuple[dict[str, Any] | None, str | None]:
+    """
+    Resolve schema from tool_schema_registry.json only when it can be proven to belong
+    to the requested MCP server (avoid cross-server collisions).
+    """
+    registry_path = os.getenv("TOOL_SCHEMA_REGISTRY_PATH", "tool_schema_registry.json")
+    try:
+        registry = load_tool_schema_registry(Path(str(registry_path)))
+    except Exception:
+        return None, None
+
+    sources = registry.sources or {}
+    src = sources.get(tool_name)
+    if not isinstance(src, dict):
+        return None, None
+    if src.get("server") != server:
+        return None, None
+
+    openai_tool = get_registry_tool_schema(registry=registry, tool_name=tool_name)
+    if not openai_tool:
+        return None, None
+
+    params_schema = _extract_openai_parameters_schema(openai_tool)
+    if not params_schema:
+        return None, None
+
+    # Do NOT apply OpenAI strict schema normalization here.
+    # This schema is used for validating arguments for an MCP tool call, not for sending
+    # tool schemas to OpenAI.
+    return params_schema, "registry_if_unambiguous"
+
+
+async def _resolve_argument_schema(
+    *, server: str, tool_name: str, source_precedence: list[str]
+) -> tuple[dict[str, Any] | None, str | None]:
+    for source in source_precedence:
+        if source == "live_tools_list_cache":
+            tools = await list_tools_for_server(server)
+            schema = _extract_mcp_input_schema(tools=tools, tool_name=tool_name)
+            if schema:
+                # Do NOT apply OpenAI strict schema normalization here.
+                # This schema is used for validating arguments against the MCP server's own
+                # declared inputSchema. Mutating additionalProperties would change semantics.
+                return schema, "live_tools_list_cache"
+
+        if source == "registry_if_unambiguous":
+            schema, src_name = _resolve_registry_schema_if_unambiguous(
+                server=server, tool_name=tool_name
+            )
+            if schema and src_name:
+                return schema, src_name
+
+    return None, None
+
+
+def _validate_arguments_against_schema(
+    *,
+    schema: dict[str, Any],
+    arguments: dict[str, Any],
+    server: str,
+    tool_name: str,
+    schema_source: str,
+) -> None:
+    if not _JSONSCHEMA_AVAILABLE or _jsonschema_validators is None:
+        raise MCPToolError(
+            -32603,
+            "Schema validation is enabled but jsonschema is not available",
+            {"error_type": "dependency_error", "dependency": "jsonschema"},
+        )
+
+    validator_cls = _jsonschema_validators.validator_for(schema)
+    validator = validator_cls(schema)
+
+    errors: list[dict[str, Any]] = []
+    for err in validator.iter_errors(arguments):
+        # JSON Pointer-ish string; keep it simple and readable.
+        path = "$." + ".".join(str(p) for p in err.path) if err.path else "$"
+        errors.append({"path": path, "message": err.message})
+        if len(errors) >= 10:
+            break
+
+    if errors:
+        raise MCPToolError(
+            -32602,
+            "Invalid tool arguments",
+            {
+                "error_type": "invalid_arguments",
+                "server": server,
+                "tool": tool_name,
+                "schema_source": schema_source,
+                "errors": errors,
+            },
+        )
+
+
+async def mcp_list_servers(
+    app_resources: dict[str, Any], arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """
+    List configured/allowlisted MCP servers for the bridge.
+
+    This is safe to implement without the external MCP runtime because it only
+    reads local config and returns non-sensitive metadata.
+    """
+    _ = app_resources  # reserved for future: injected config/cache
+    _ = arguments
+
+    cfg = _load_abacus_proxy_mcp_config()
+    bridge = _get_bridge_block(cfg)
+
+    allowlist = bridge.get("server_allowlist")
+    if not isinstance(allowlist, list):
+        allowlist = []
+
+    servers: list[dict[str, Any]] = []
+    for name in allowlist:
+        if not isinstance(name, str) or not name.strip():
+            continue
+        name = name.strip()
+
+        raw_server_cfg = cfg.get(name)
+        server_cfg = raw_server_cfg if isinstance(raw_server_cfg, dict) else {}
+
+        merged_policy = _merge_server_policy(bridge, name)
+
+        # Return minimal safe metadata; never leak command-lines/env.
+        servers.append(
+            {
+                "name": name,
+                "configured": bool(server_cfg),
+                "transport": server_cfg.get("type") or server_cfg.get("transport") or "unknown",
+                "url": server_cfg.get("url"),
+                "bridge_enabled": bool(bridge.get("enabled", False)),
+                "server_enabled": bool(merged_policy.get("enabled", True)),
+            }
+        )
+
+    return {
+        "status": "success",
+        "bridge_enabled": bool(bridge.get("enabled", False)),
+        "server_allowlist": allowlist,
+        "servers": servers,
+    }
+
+
+async def mcp_list_tools(
+    app_resources: dict[str, Any], arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """
+    List tools available on a configured external MCP server.
+
+    Policy enforcement happens here (bridge enabled + server allowlist), then the
+    transport runtime is delegated to src/mcp/bridge_client.py.
+    """
+    _ = app_resources  # reserved for future: shared caches/resources
+
+    server = arguments.get("server")
+    if not isinstance(server, str) or not server.strip():
+        raise MCPToolError(
+            -32602,
+            "Missing required parameter: server",
+            {"error_type": "invalid_arguments"},
+        )
+    server = server.strip()
+
+    cfg = _load_abacus_proxy_mcp_config()
+    bridge = _get_bridge_block(cfg)
+
+    if not bool(bridge.get("enabled", False)):
+        raise MCPToolError(
+            -32603,
+            "MCP bridge is disabled",
+            {"error_type": "policy_denied", "reason": "bridge_disabled"},
+        )
+
+    allowlist = bridge.get("server_allowlist")
+    if not isinstance(allowlist, list) or server not in allowlist:
+        raise MCPToolError(
+            -32603,
+            "MCP server is not allowlisted",
+            {"error_type": "policy_denied", "reason": "server_not_allowlisted", "server": server},
+        )
+
+    tools = await list_tools_for_server(server)
+    return {
+        "status": "success",
+        "server": server,
+        "tools": tools,
+        "total_tools": len(tools),
+    }
+
+
+# ---------------------------------------------------------------------------
+# MCP Bridge guardrails (Task 85)
+# ---------------------------------------------------------------------------
+
+# NOTE: These counters are process-local (best-effort) and intended for quick observability,
+# not billing-grade metrics.
+_MCP_BRIDGE_METRICS: Counter[str] = Counter()
+
+
+def _now_ms() -> int:
+    return int(time.monotonic() * 1000)
+
+
+def _new_call_id() -> str:
+    # Short, sortable-ish call id for correlation in logs.
+    return f"mcpb_{_now_ms()}_{secrets.token_hex(4)}"
+
+
+def _get_hygiene_block(bridge: dict[str, Any]) -> dict[str, Any]:
+    raw = bridge.get("hygiene")
+    return raw if isinstance(raw, dict) else {}
+
+
+def _get_server_transport_from_cfg(cfg: dict[str, Any], server: str) -> str:
+    server_cfg = cfg.get(server)
+    if not isinstance(server_cfg, dict):
+        return "unknown"
+    t = server_cfg.get("type") or server_cfg.get("transport") or "unknown"
+    return str(t).lower().strip() or "unknown"
+
+
+def _get_allowed_transports(bridge: dict[str, Any], server: str) -> set[str] | None:
+    merged = _merge_server_policy(bridge, server)
+    raw = merged.get("allowed_transports")
+    if not isinstance(raw, list):
+        return None
+    out: set[str] = set()
+    for v in raw:
+        if isinstance(v, str) and v.strip():
+            out.add(v.lower().strip())
+    return out or None
+
+
+_PROMPT_INJECTION_RE = re.compile(
+    r"(?is)\b(ignore|disregard|override)\b.{0,40}\b(previous|prior|all)\b.{0,40}\b(instruction|instructions|system)\b"
+)
+
+
+def _sanitize_tool_output_text(*, text: str, max_chars: int) -> tuple[str, list[str]]:
+    """
+    Sanitize untrusted tool output text for safer *display and downstream prompting*.
+
+    We do NOT mutate the raw MCP tool result. Instead we provide a sanitized view and warnings.
+    """
+    warnings: list[str] = []
+
+    if not isinstance(text, str):
+        text = str(text)
+
+    # Size limit
+    if max_chars > 0 and len(text) > max_chars:
+        text = text[:max_chars] + "…"
+        warnings.append("output_truncated")
+
+    # Detect prompt-injection style phrases
+    if _PROMPT_INJECTION_RE.search(text):
+        warnings.append("prompt_injection_pattern_detected")
+
+    # If tool output contains XML-ish tool tags, provide an escaped view so strict runners
+    # don't mistakenly interpret it as a tool call.
+    if re.search(r"<\s*[A-Za-z_][A-Za-z0-9_-]*\b", text):
+        warnings.append("tool_tag_like_output_detected")
+        # Minimal XML escaping
+        text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    return text, warnings
+
+
+def _apply_hygiene_to_content(
+    *, bridge: dict[str, Any], content: dict[str, Any]
+) -> tuple[dict[str, Any], list[str]]:
+    hygiene = _get_hygiene_block(bridge)
+    if not bool(hygiene.get("enabled", True)):
+        return content, []
+
+    # Default: keep small enough to avoid blowing up prompts/logs.
+    max_chars = hygiene.get("max_output_chars", 20000)
+    try:
+        max_chars_int = int(max_chars)
+    except Exception:
+        max_chars_int = 20000
+
+    warnings: list[str] = []
+    out = dict(content)
+
+    if isinstance(out.get("text"), str):
+        sanitized, w = _sanitize_tool_output_text(text=out["text"], max_chars=max_chars_int)
+        out["text_sanitized"] = sanitized
+        warnings.extend(w)
+
+    return out, warnings
+
+
+def _record_bridge_metric(*, key: str) -> None:
+    if isinstance(key, str) and key:
+        _MCP_BRIDGE_METRICS[key] += 1
+
+
+def _audit_log(
+    *,
+    call_id: str,
+    server: str,
+    tool: str,
+    ok: bool,
+    duration_ms: int,
+    error_type: str | None = None,
+    reason: str | None = None,
+    schema_source: str | None = None,
+    arguments_redacted: dict[str, Any] | None = None,
+) -> None:
+    # Audit is config-driven under mcp_bridge.audit; we assume caller already decided whether
+    # to include arguments_redacted.
+    #
+    # IMPORTANT: Include critical correlation fields in the *message string* too, because many
+    # log sinks/handlers show only the message by default (bind() fields may not appear).
+    try:
+        msg = (
+            "mcp_bridge_call "
+            f"call_id={call_id} server={server} tool={tool} ok={ok} duration_ms={duration_ms}"
+        )
+        if error_type:
+            msg += f" error_type={error_type}"
+        if reason:
+            msg += f" reason={reason}"
+        if schema_source:
+            msg += f" schema_source={schema_source}"
+
+        logger.bind(
+            event="mcp_bridge_call",
+            call_id=call_id,
+            mcp_server=server,
+            mcp_tool=tool,
+            ok=ok,
+            duration_ms=duration_ms,
+            error_type=error_type,
+            reason=reason,
+            schema_source=schema_source,
+            arguments_redacted=arguments_redacted,
+        ).info(msg)
+    except Exception:
+        # Never fail the tool call due to logging issues.
+        return
+
+
+def _get_audit_block(bridge: dict[str, Any]) -> dict[str, Any]:
+    raw = bridge.get("audit")
+    return raw if isinstance(raw, dict) else {}
+
+
+def _truncate_str(s: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    if len(s) <= max_chars:
+        return s
+    return s[:max_chars] + "…"
+
+
+def _redact_for_audit(value: Any, *, redact_keys: set[str], max_depth: int = 6) -> Any:
+    """Redact sensitive keys recursively for audit/debug payloads."""
+    if max_depth <= 0:
+        return "<max_depth>"
+
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            ks = str(k)
+            if ks.lower() in redact_keys:
+                out[ks] = "<redacted>"
+            else:
+                out[ks] = _redact_for_audit(v, redact_keys=redact_keys, max_depth=max_depth - 1)
+        return out
+
+    if isinstance(value, list):
+        # Keep list length bounded to avoid huge error payloads
+        return [
+            _redact_for_audit(v, redact_keys=redact_keys, max_depth=max_depth - 1)
+            for v in value[:50]
+        ]
+
+    if isinstance(value, str):
+        return value
+
+    return value
+
+
+def _safe_arguments_snapshot(
+    *, bridge: dict[str, Any], args_payload: dict[str, Any]
+) -> dict[str, Any] | None:
+    """
+    Return a redacted + truncated snapshot of arguments for safe debugging, controlled by config.
+    """
+    audit = _get_audit_block(bridge)
+    if not bool(audit.get("enabled", False)):
+        return None
+    if not bool(audit.get("log_arguments", False)):
+        return None
+
+    redact_keys_raw = audit.get("redact_keys", [])
+    redact_keys: set[str] = set()
+    if isinstance(redact_keys_raw, list):
+        for k in redact_keys_raw:
+            if isinstance(k, str) and k.strip():
+                redact_keys.add(k.strip().lower())
+
+    max_arg_chars = audit.get("max_arg_chars", 2000)
+    try:
+        max_arg_chars_int = int(max_arg_chars)
+    except Exception:
+        max_arg_chars_int = 2000
+
+    redacted = _redact_for_audit(args_payload, redact_keys=redact_keys)
+
+    try:
+        rendered = json.dumps(redacted, ensure_ascii=False, default=str)
+    except Exception:
+        rendered = str(redacted)
+
+    rendered = _truncate_str(rendered, max_arg_chars_int)
+
+    # Return both structured + rendered forms so callers can choose.
+    return {"redacted": redacted, "rendered": rendered, "max_arg_chars": max_arg_chars_int}
+
+
+def _normalize_mcp_result_content(*, result: dict[str, Any]) -> dict[str, Any]:
+    """
+    Create a stable, proxy-friendly view of an MCP tool `result` object.
+
+    - If result contains MCP `content` blocks, return them with a convenience `text`
+      field that concatenates text blocks.
+    - Otherwise return a `raw` wrapper.
+    """
+    content_blocks = result.get("content")
+    if not isinstance(content_blocks, list):
+        return {"type": "raw", "value": result}
+
+    # Bound the number of content blocks we surface to avoid accidental prompt/log bloat.
+    content_blocks = [b for b in content_blocks if isinstance(b, dict)][:50]
+
+    texts: list[str] = []
+    for block in content_blocks:
+        if block.get("type") == "text" and isinstance(block.get("text"), str):
+            texts.append(block["text"])
+
+    out: dict[str, Any] = {"type": "mcp_content", "content": content_blocks}
+    if texts:
+        out["text"] = "\n".join(texts)
+    return out
+
+
+async def mcp_call(app_resources: dict[str, Any], arguments: dict[str, Any]) -> dict[str, Any]:
+    """
+    Call a tool on a configured external MCP server.
+
+    Guardrails (Task 85):
+    - policy enforcement (server allowlist, tool allow/deny, transport allowlist)
+    - correlation IDs
+    - audit logging + lightweight metrics (best-effort)
+    - output hygiene (sanitize tool-tag-like output and truncate large outputs)
+    """
+    _ = app_resources  # reserved for future: shared caches/resources
+
+    started_ms = _now_ms()
+
+    tool_ref = arguments.get("tool_ref")
+    server = arguments.get("server")
+    tool = arguments.get("tool")
+
+    call_id = arguments.get("call_id")
+    if not isinstance(call_id, str) or not call_id.strip():
+        call_id = _new_call_id()
+    call_id = call_id.strip()
+
+    # Parse tool ref / parameters
+    if isinstance(tool_ref, str) and tool_ref.strip():
+        server, tool = _parse_tool_ref(tool_ref.strip())
+    else:
+        if not isinstance(server, str) or not server.strip():
+            raise MCPToolError(
+                -32602,
+                "Missing required parameter: server (or provide tool_ref)",
+                {"error_type": "invalid_arguments", "call_id": call_id},
+            )
+        if not isinstance(tool, str) or not tool.strip():
+            raise MCPToolError(
+                -32602,
+                "Missing required parameter: tool (or provide tool_ref)",
+                {"error_type": "invalid_arguments", "call_id": call_id},
+            )
+        server = server.strip()
+        tool = tool.strip()
+
+    args_payload = arguments.get("arguments", {})
+    if args_payload is None:
+        args_payload = {}
+    if not isinstance(args_payload, dict):
+        raise MCPToolError(
+            -32602,
+            "Parameter 'arguments' must be an object",
+            {"error_type": "invalid_arguments", "server": server, "tool": tool, "call_id": call_id},
+        )
+
+    cfg = _load_abacus_proxy_mcp_config()
+    bridge = _get_bridge_block(cfg)
+
+    args_snapshot = _safe_arguments_snapshot(bridge=bridge, args_payload=args_payload)
+
+    schema_source: str | None = None
+    policy_reason: str | None = None
+
+    try:
+        # Base bridge enable gate
+        if not bool(bridge.get("enabled", False)):
+            policy_reason = "bridge_disabled"
+            raise MCPToolError(
+                -32603,
+                "MCP bridge is disabled",
+                {"error_type": "policy_denied", "reason": policy_reason},
+            )
+
+        # Ensure server exists in config to avoid accidentally proxying unknown endpoints.
+        if not isinstance(cfg.get(server), dict):
+            policy_reason = "server_not_configured"
+            raise MCPToolError(
+                -32603,
+                "MCP server is not configured",
+                {"error_type": "policy_denied", "reason": policy_reason, "server": server},
+            )
+
+        # Tool allow/deny policy
+        allowed, reason = _is_tool_allowed(bridge, server, tool)
+        if not allowed:
+            policy_reason = reason
+            raise MCPToolError(
+                -32603,
+                "MCP tool call denied by policy",
+                {"error_type": "policy_denied", "server": server, "tool": tool, "reason": reason},
+            )
+
+        # Transport policy (optional): enforce allowed_transports if configured
+        allowed_transports = _get_allowed_transports(bridge, server)
+        if allowed_transports is not None:
+            transport = _get_server_transport_from_cfg(cfg, server)
+            if transport not in allowed_transports:
+                policy_reason = "transport_not_allowed"
+                raise MCPToolError(
+                    -32603,
+                    "MCP transport denied by policy",
+                    {
+                        "error_type": "policy_denied",
+                        "server": server,
+                        "tool": tool,
+                        "reason": policy_reason,
+                        "transport": transport,
+                        "allowed_transports": sorted(allowed_transports),
+                    },
+                )
+
+        # Optional argument schema validation (task 83)
+        schema_block = _get_schema_validation_block(bridge)
+        if bool(schema_block.get("enabled", False)):
+            precedence = schema_block.get("source_precedence")
+            if not isinstance(precedence, list):
+                precedence = ["live_tools_list_cache", "registry_if_unambiguous"]
+            precedence = [str(x) for x in precedence if isinstance(x, str) and str(x).strip()]
+
+            schema, schema_source = await _resolve_argument_schema(
+                server=server, tool_name=tool, source_precedence=precedence
+            )
+            if schema and schema_source:
+                _validate_arguments_against_schema(
+                    schema=schema,
+                    arguments=args_payload,
+                    server=server,
+                    tool_name=tool,
+                    schema_source=schema_source,
+                )
+
+        result = await call_tool_on_server(server, tool, args_payload)
+
+        duration_ms = max(0, _now_ms() - started_ms)
+        content = _normalize_mcp_result_content(result=result)
+        content, hygiene_warnings = _apply_hygiene_to_content(bridge=bridge, content=content)
+
+        _record_bridge_metric(key="mcp_bridge.ok")
+        _record_bridge_metric(key=f"mcp_bridge.ok.server:{server}")
+        _record_bridge_metric(key=f"mcp_bridge.ok.server:{server}.tool:{tool}")
+
+        audit = _get_audit_block(bridge)
+        if bool(audit.get("enabled", False)):
+            _audit_log(
+                call_id=call_id,
+                server=server,
+                tool=tool,
+                ok=True,
+                duration_ms=duration_ms,
+                schema_source=schema_source,
+                arguments_redacted=args_snapshot,
+            )
+
+        return {
+            "status": "success",
+            "ok": True,
+            "call_id": call_id,
+            "server": server,
+            "tool": tool,
+            "duration_ms": duration_ms,
+            "warnings": hygiene_warnings,
+            "content": content,
+            "result": result,
+        }
+
+    except MCPToolError as e:
+        duration_ms = max(0, _now_ms() - started_ms)
+
+        data = e.data if isinstance(e.data, dict) else {}
+        error_type = data.get("error_type")
+
+        # Normalize/derive error_type if missing or inconsistent.
+        if not isinstance(error_type, str) or not error_type:
+            if e.code == -32601:
+                error_type = "tool_not_found"
+            elif e.code == -32602:
+                error_type = "invalid_arguments"
+            else:
+                error_type = "tool_error"
+
+        normalized_data = dict(data)
+        normalized_data.update(
+            {
+                "error_type": error_type,
+                "server": server,
+                "tool": tool,
+                "call_id": call_id,
+                "duration_ms": duration_ms,
+            }
+        )
+        if schema_source and "schema_source" not in normalized_data:
+            normalized_data["schema_source"] = schema_source
+        if args_snapshot is not None and "arguments_redacted" not in normalized_data:
+            normalized_data["arguments_redacted"] = args_snapshot
+
+        # Metrics + audit (best-effort)
+        _record_bridge_metric(key="mcp_bridge.error")
+        _record_bridge_metric(key=f"mcp_bridge.error.type:{error_type}")
+        _record_bridge_metric(key=f"mcp_bridge.error.server:{server}")
+        _record_bridge_metric(key=f"mcp_bridge.error.server:{server}.tool:{tool}")
+
+        audit = _get_audit_block(bridge)
+        if bool(audit.get("enabled", False)):
+            _audit_log(
+                call_id=call_id,
+                server=server,
+                tool=tool,
+                ok=False,
+                duration_ms=duration_ms,
+                error_type=error_type,
+                reason=policy_reason or normalized_data.get("reason"),
+                schema_source=schema_source,
+                arguments_redacted=args_snapshot,
+            )
+
+        raise MCPToolError(e.code, e.message, normalized_data) from e
+    except Exception as e:
+        duration_ms = max(0, _now_ms() - started_ms)
+
+        _record_bridge_metric(key="mcp_bridge.error")
+        _record_bridge_metric(key="mcp_bridge.error.type:internal_error")
+        _record_bridge_metric(key=f"mcp_bridge.error.server:{server}")
+        _record_bridge_metric(key=f"mcp_bridge.error.server:{server}.tool:{tool}")
+
+        audit = _get_audit_block(bridge)
+        if bool(audit.get("enabled", False)):
+            _audit_log(
+                call_id=call_id,
+                server=server,
+                tool=tool,
+                ok=False,
+                duration_ms=duration_ms,
+                error_type="internal_error",
+                reason=policy_reason,
+                schema_source=schema_source,
+                arguments_redacted=args_snapshot,
+            )
+
+        raise MCPToolError(
+            -32603,
+            "Internal error",
+            {
+                "error_type": "internal_error",
+                "server": server,
+                "tool": tool,
+                "call_id": call_id,
+                "duration_ms": duration_ms,
+                "arguments_redacted": args_snapshot,
+            },
+        ) from e

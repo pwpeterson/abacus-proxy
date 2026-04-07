@@ -164,18 +164,9 @@ class MemoryService:
             if project_id:
                 mem0_metadata["project_id"] = project_id
 
-            # Try mem0 add() first.
-            try:
-                res_any: Any = self._memory.add(
-                    messages=messages,
-                    user_id=user_id,
-                    agent_id=agent_id,
-                    run_id=run_id,
-                    metadata=mem0_metadata,
-                )
-            except Exception as e:
-                logger.warning(f"mem0.add failed; will try direct upsert fallback: {e}")
-                res_any = None
+            # Skip mem0.add() - it requires LLM extraction which often fails.
+            # Go directly to upsert fallback for reliability.
+            res_any: Any = None
 
             # Prefer direct upsert if qdrant client is available (bypasses mem0 extraction flakiness).
             vector_store = getattr(self._memory, "vector_store", None)
@@ -251,6 +242,13 @@ class MemoryService:
         text = (text or "").strip()
         if not text:
             return MemoryAddResponse(success=False, memory_ids=[], message="Empty text")
+
+        # Truncate text to avoid exceeding embedding model token limits (8192 for text-embedding-3-small)
+        # Rough estimate: 1 token ≈ 4 chars, so 8192 tokens ≈ 32768 chars
+        MAX_CHARS = 30000  # Conservative limit to stay under 8192 tokens
+        if len(text) > MAX_CHARS:
+            logger.warning(f"Text length {len(text)} exceeds {MAX_CHARS} chars; truncating for embedding")
+            text = text[:MAX_CHARS]
 
         # Requires direct qdrant access
         if not (
@@ -351,6 +349,12 @@ class MemoryService:
         if not query:
             return MemorySearchResponse(results=[], total=0)
 
+        # Mem0 requires at least one of user_id, agent_id, or run_id
+        # Default to a generic user_id if none provided
+        if not user_id and not agent_id and not run_id:
+            user_id = "default"
+            logger.debug("No user_id/agent_id/run_id provided; defaulting to user_id='default'")
+
         try:
             res_any = self._memory.search(
                 query=query,
@@ -409,6 +413,7 @@ class MemoryService:
         if not self.is_enabled:
             return ""
 
+        # Ensure at least one ID is provided (search_memory will default user_id if needed)
         res = self.search_memory(
             query=query,
             user_id=user_id,

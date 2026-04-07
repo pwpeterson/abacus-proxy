@@ -7,8 +7,14 @@ WORKDIR /app
 ENV VIRTUAL_ENV=/opt/venv
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y curl procps && rm -rf /var/lib/apt/lists/*
+# Install system dependencies including Node.js
+RUN apt-get update && apt-get install -y \
+    curl \
+    procps \
+    nodejs \
+    npm \
+    git \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy dependency files
 COPY pyproject.toml uv.lock README.md ./
@@ -17,6 +23,9 @@ COPY pyproject.toml uv.lock README.md ./
 COPY src/ ./src/
 COPY modules/ ./modules/
 COPY utils/ ./utils/
+
+# Note: .roo/mcp.json will be available via volume mount at runtime
+# Auto-discovery will find it from the mounted workspace or fall back to global config
 
 # Install dependencies (uv sync creates a local virtualenv)
 # Include memory extra for Mem0 integration (mem0ai, qdrant-client, etc.)

@@ -28,10 +28,13 @@ from src.utils.code_jit_prompt_injector import inject_code_jit_context
 from src.utils.context_manager import ContextManager
 from src.utils.memory_service import MemoryService
 from src.utils.prompt_guard import guard_chat_messages
+from src.utils.request_logger import AbacusRequestLogger
 from src.utils.rules_prompt_injector import inject_retrieved_rules
 from src.utils.startup_indexer import auto_index_rules_on_startup
+from src.utils.tool_discovery import build_tool_map, discover_all_tools
 from src.utils.tool_filter import ToolFilter
 from src.utils.tool_schema_registry import load_tool_schema_registry, select_registry_tools_for_injection
+from src.utils.tool_selector import select_tools_for_request
 
 StartupHook = Callable[[dict[str, Any]], Awaitable[None]]
 ShutdownHook = Callable[[], Awaitable[None]]
@@ -114,6 +117,38 @@ def create_app(
                 app.state.tool_registry = None
         else:
             app.state.tool_registry = None
+
+        # Initialize request tracking (best-effort; do not prevent startup)
+        request_logger = AbacusRequestLogger(
+            enabled=bool(getattr(config, "enable_request_tracking", False)),
+            supabase_url=getattr(config, "supabase_url", None),
+            supabase_service_role_key=getattr(config, "supabase_service_role_key", None),
+            http_timeout_seconds=float(
+                getattr(config, "request_tracking_timeout_seconds", 2.5)
+            ),
+        )
+        app.state.request_logger = request_logger
+        logger.bind(request_tracking_enabled=request_logger.enabled).info(
+            "Request tracking initialized"
+        )
+
+        # Initialize dynamic tool discovery (best-effort; do not prevent startup)
+        try:
+            logger.info("Discovering tools from MCP servers...")
+            discovered_tools = await discover_all_tools(force_refresh=True)
+            tool_map = build_tool_map(discovered_tools)
+            
+            app.state.discovered_tools = discovered_tools
+            app.state.tool_map = tool_map
+            
+            total_tools = sum(len(tools) for tools in discovered_tools.values())
+            logger.info(
+                f"Tool discovery complete: {total_tools} tools from {len(discovered_tools)} sources"
+            )
+        except Exception as e:
+            logger.error(f"Tool discovery failed (non-fatal): {e}")
+            app.state.discovered_tools = {}
+            app.state.tool_map = {}
 
         if on_startup:
             await on_startup(
@@ -899,27 +934,28 @@ def create_app(
         # Prompt guard last (it may drop old messages; should run after condensation store).
         _apply_prompt_guard(payload)
 
-        # Tool registry: injection and filtering
-        tool_registry = getattr(app.state, "tool_registry", None)
-        if tool_registry is not None:
+        # Dynamic tool discovery and injection
+        discovered_tools = getattr(app.state, "discovered_tools", {})
+        if discovered_tools:
             messages = payload.get("messages", [])
             tools = payload.get("tools")
             
             # Server-side tool injection (when client omits tools)
-            if not tools and bool(getattr(config, "enable_tool_injection", False)):
-                max_tools = int(getattr(config, "tool_injection_max_tools", 20))
-                max_tool_tokens = int(getattr(config, "tool_injection_max_tokens", 5000))
+            if not tools and bool(getattr(config, "enable_tool_injection", True)):
+                max_tools = int(getattr(config, "tool_injection_max_tools", 50))
                 
-                injected_tools = select_registry_tools_for_injection(
-                    registry=tool_registry,
+                # Use intelligent tool selection
+                mem0_context = payload.get("_mem0_context", {})
+                selected_tools = await select_tools_for_request(
                     messages=messages,
-                    max_tools=max_tools,
-                    max_tool_tokens=max_tool_tokens,
+                    mem0_context=mem0_context,
+                    available_tools=discovered_tools,
+                    max_tools=max_tools
                 )
                 
-                if injected_tools:
-                    payload["tools"] = injected_tools
-                    logger.info(f"Injected {len(injected_tools)} tools from registry")
+                if selected_tools:
+                    payload["tools"] = selected_tools
+                    logger.info(f"Injected {len(selected_tools)} dynamically selected tools")
             
             # Client-provided tools filtering (when client provides tools)
             elif tools and isinstance(tools, list) and bool(getattr(config, "enable_tool_filtering", False)):
@@ -938,6 +974,27 @@ def create_app(
                         f"Filtered tools: {filter_stats['original_count']} → {filter_stats['filtered_count']} "
                         f"({filter_stats.get('reduction_percent', 0):.1f}% reduction)"
                     )
+        else:
+            # Fallback to old tool registry if discovery failed
+            tool_registry = getattr(app.state, "tool_registry", None)
+            if tool_registry is not None:
+                messages = payload.get("messages", [])
+                tools = payload.get("tools")
+                
+                if not tools and bool(getattr(config, "enable_tool_injection", False)):
+                    max_tools = int(getattr(config, "tool_injection_max_tools", 20))
+                    max_tool_tokens = int(getattr(config, "tool_injection_max_tokens", 5000))
+                    
+                    injected_tools = select_registry_tools_for_injection(
+                        registry=tool_registry,
+                        messages=messages,
+                        max_tools=max_tools,
+                        max_tool_tokens=max_tool_tokens,
+                    )
+                    
+                    if injected_tools:
+                        payload["tools"] = injected_tools
+                        logger.info(f"Injected {len(injected_tools)} tools from registry (fallback)")
 
         # Sanitize tool schemas for upstream compatibility.
         #
@@ -1147,6 +1204,30 @@ def create_app(
             try:
                 data = r.json()
                 data = _rewrite_text_only_to_attempt_completion(data)
+                
+                # Log request (best-effort, never blocks)
+                try:
+                    request_logger_inst = getattr(app.state, "request_logger", None)
+                    if request_logger_inst and request_logger_inst.enabled:
+                        request_id = request.headers.get("x-request-id") or f"req_{uuid.uuid4()}"
+                        
+                        # Determine routing metadata
+                        routing_method = "intelligent" if upstream_model != requested_model and requested_model == "route-llm" else "direct"
+                        use_case = _detect_use_case(payload) if routing_method == "intelligent" else None
+                        
+                        request_logger_inst.log_request(
+                            request_id=request_id,
+                            request_payload=payload if config.store_request_payloads else {},
+                            response_payload=data if config.store_response_payloads else {},
+                            status_code=r.status_code,
+                            routing_method=routing_method,
+                            requested_model=requested_model,
+                            selected_model=upstream_model,
+                            use_case_detected=use_case,
+                        )
+                except Exception as log_err:
+                    logger.warning(f"Request tracking failed (ignored): {log_err}")
+                
                 return JSONResponse(status_code=r.status_code, content=data)
             except Exception:
                 return JSONResponse(
