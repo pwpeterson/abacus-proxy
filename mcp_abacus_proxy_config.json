@@ -1,0 +1,14 @@
+{
+  "mcp_bridge": {
+    "server_allowlist": ["model-proxy"],
+    "defaults": {
+      "timeout_ms": 30000,
+      "connect_timeout_ms": 5000,
+      "max_concurrent": 5
+    }
+  },
+  "model-proxy": {
+    "type": "sse",
+    "url": "http://localhost:9002"
+  }
+}
