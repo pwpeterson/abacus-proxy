@@ -1,0 +1,40 @@
+[Unit]
+Description=Abacus Proxy (Host Mode - Direct MCP Access)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/pwp/srv/apps/abacus-proxy
+
+# Load environment files
+EnvironmentFile=-/etc/containers/systemd/.env
+EnvironmentFile=-/etc/containers/systemd/supabase.env
+EnvironmentFile=-/etc/containers/systemd/model-proxy.env
+EnvironmentFile=-/etc/containers/systemd/abacus-proxy.env
+
+# Service-specific environment
+Environment=ENABLE_PROMPT_LOGGING=true
+Environment=ENABLE_RAW_RESPONSE_LOGGING=true
+Environment=PORT=8003
+Environment=MCP_PORT=9003
+Environment=HOST=0.0.0.0
+
+# Run with uv (uses project's pyproject.toml)
+ExecStart=/home/pwp/.local/bin/uv run --frozen uvicorn src.main_fastapi:app --host 0.0.0.0 --port 8003
+
+# Restart policy
+Restart=always
+RestartSec=10
+
+# Resource limits
+MemoryHigh=2G
+MemoryMax=3G
+CPUQuota=200%%
+
+# Timeouts
+TimeoutStartSec=120s
+TimeoutStopSec=60s
+
+[Install]
+WantedBy=multi-user.target

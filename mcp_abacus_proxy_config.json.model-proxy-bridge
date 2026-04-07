@@ -1,4 +1,5 @@
 {
+  "_comment": "This config uses model-proxy as bridge - NOT RECOMMENDED as model-proxy will be shut down",
   "mcp_bridge": {
     "server_allowlist": ["model-proxy"],
     "defaults": {
