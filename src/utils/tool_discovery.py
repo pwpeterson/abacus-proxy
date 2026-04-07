@@ -167,8 +167,9 @@ def _get_roo_code_tools() -> list[dict[str, Any]]:
 
 # HTTP-based MCP servers configuration
 # Maps server name to (default_url, env_var_name)
+# NOTE: Server names must match exactly with MCP server configuration names
 HTTP_MCP_SERVERS = {
-    "mcp_toolbox": ("http://127.0.0.1:8004/tools", "MCP_TOOLBOX_URL"),
+    "mcp-toolbox": ("http://127.0.0.1:8004/tools", "MCP_TOOLBOX_URL"),
     "mcp-crawl4ai-rag": ("http://localhost:8051/tools", "MCP_CRAWL4AI_RAG_URL"),
 }
 
@@ -212,11 +213,22 @@ async def _get_http_mcp_tools(server_name: str, url: str) -> list[dict[str, Any]
                 logger.warning(f"{server_name} tools is not a list: {type(tools_list)}")
                 return []
             
-            # Convert to OpenAI function calling format
+            # Convert to OpenAI function calling format (with deduplication)
             openai_tools = []
+            seen_names = set()
+            
             for tool in tools_list:
                 if not isinstance(tool, dict) or "name" not in tool:
                     continue
+                
+                tool_name = tool["name"]
+                
+                # Skip duplicates
+                if tool_name in seen_names:
+                    logger.debug(f"Skipping duplicate tool '{tool_name}' from {server_name}")
+                    continue
+                
+                seen_names.add(tool_name)
                 
                 # Use inputSchema if available, otherwise empty schema
                 parameters = tool.get("inputSchema", {
@@ -228,7 +240,7 @@ async def _get_http_mcp_tools(server_name: str, url: str) -> list[dict[str, Any]
                 openai_tool = {
                     "type": "function",
                     "function": {
-                        "name": tool["name"],
+                        "name": tool_name,
                         "description": tool.get("description", ""),
                         "parameters": parameters
                     },
