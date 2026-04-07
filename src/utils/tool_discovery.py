@@ -173,6 +173,13 @@ HTTP_MCP_SERVERS = {
     "mcp-crawl4ai-rag": ("http://localhost:8051/tools", "MCP_CRAWL4AI_RAG_URL"),
 }
 
+# Servers that should be discovered ONLY via HTTP (excluded from SSE/stdio discovery)
+# Other servers in HTTP_MCP_SERVERS will be discovered via BOTH HTTP and SSE/stdio
+HTTP_ONLY_SERVERS = {
+    "mcp-toolbox",      # Only HTTP, no SSE server available
+    "mcp-crawl4ai-rag", # Only HTTP, use http://localhost:8051/tools
+}
+
 
 async def _get_http_mcp_tools(server_name: str, url: str) -> list[dict[str, Any]]:
     """Get tools from an HTTP MCP endpoint.
@@ -313,17 +320,15 @@ async def discover_all_tools(
     # Load MCP server configurations dynamically
     mcp_loader = get_mcp_loader()
     
-    # Get list of servers to discover (excluding HTTP-discovered ones)
-    http_server_names = set(HTTP_MCP_SERVERS.keys())
-    
+    # Get list of servers to discover (excluding HTTP-only servers)
     if selected_servers is None:
-        # Discover all available servers, excluding HTTP-discovered ones
+        # Discover all available servers, excluding HTTP-only ones
         all_servers = mcp_loader.get_all_server_names()
-        server_list = [s for s in all_servers if s not in http_server_names]
-        logger.info(f"Discovering tools from {len(server_list)} configured servers (excluding {len(http_server_names)} HTTP servers)")
+        server_list = [s for s in all_servers if s not in HTTP_ONLY_SERVERS]
+        logger.info(f"Discovering tools from {len(server_list)} configured servers (excluding {len(HTTP_ONLY_SERVERS)} HTTP-only servers)")
     else:
-        # Only discover selected servers, excluding HTTP-discovered ones
-        server_list = [s for s in selected_servers if s not in http_server_names]
+        # Only discover selected servers, excluding HTTP-only ones
+        server_list = [s for s in selected_servers if s not in HTTP_ONLY_SERVERS]
         logger.info(f"Discovering tools from {len(server_list)} selected servers")
     
     # Discover tools from each MCP server
