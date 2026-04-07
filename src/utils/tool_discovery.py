@@ -301,14 +301,17 @@ async def discover_all_tools(
     # Load MCP server configurations dynamically
     mcp_loader = get_mcp_loader()
     
-    # Get list of servers to discover
+    # Get list of servers to discover (excluding HTTP-discovered ones)
+    http_server_names = set(HTTP_MCP_SERVERS.keys())
+    
     if selected_servers is None:
-        # Discover all available servers
-        server_list = mcp_loader.get_all_server_names()
-        logger.info(f"Discovering tools from all {len(server_list)} configured servers")
+        # Discover all available servers, excluding HTTP-discovered ones
+        all_servers = mcp_loader.get_all_server_names()
+        server_list = [s for s in all_servers if s not in http_server_names]
+        logger.info(f"Discovering tools from {len(server_list)} configured servers (excluding {len(http_server_names)} HTTP servers)")
     else:
-        # Only discover selected servers
-        server_list = selected_servers
+        # Only discover selected servers, excluding HTTP-discovered ones
+        server_list = [s for s in selected_servers if s not in http_server_names]
         logger.info(f"Discovering tools from {len(server_list)} selected servers")
     
     # Discover tools from each MCP server
