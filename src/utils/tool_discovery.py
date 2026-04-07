@@ -15,6 +15,13 @@ from loguru import logger
 from src.mcp.bridge_client import list_tools_for_server
 from src.utils.dynamic_mcp_loader import get_mcp_loader
 
+try:
+    import httpx
+    _HTTPX_AVAILABLE = True
+except ImportError:
+    httpx = None
+    _HTTPX_AVAILABLE = False
+
 
 # Cache for discovered tools (refreshed periodically)
 _TOOL_CACHE: dict[str, list[dict[str, Any]]] = {}
@@ -158,6 +165,67 @@ def _get_roo_code_tools() -> list[dict[str, Any]]:
     ]
 
 
+async def _get_mcp_toolbox_tools() -> list[dict[str, Any]]:
+    """Get tools from mcp_toolbox HTTP endpoint.
+    
+    Fetches the tool list from http://127.0.0.1:8004/tools and converts
+    to OpenAI function calling format.
+    
+    Returns:
+        List of tools in OpenAI format, or empty list if unavailable
+    """
+    if not _HTTPX_AVAILABLE or httpx is None:
+        logger.warning("httpx not available, skipping mcp_toolbox discovery")
+        return []
+    
+    toolbox_url = os.getenv("MCP_TOOLBOX_URL", "http://127.0.0.1:8004/tools")
+    
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:  # type: ignore[union-attr]
+            response = await client.get(toolbox_url)
+            
+            if response.status_code != 200:
+                logger.warning(f"mcp_toolbox returned status {response.status_code}")
+                return []
+            
+            tools_data = response.json()
+            
+            if not isinstance(tools_data, list):
+                logger.warning(f"mcp_toolbox returned non-list: {type(tools_data)}")
+                return []
+            
+            # Convert to OpenAI function calling format
+            openai_tools = []
+            for tool in tools_data:
+                if not isinstance(tool, dict) or "name" not in tool:
+                    continue
+                
+                openai_tool = {
+                    "type": "function",
+                    "function": {
+                        "name": tool["name"],
+                        "description": tool.get("description", ""),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {},
+                            "required": []
+                        }
+                    },
+                    "_mcp_server": "mcp_toolbox"  # Internal metadata for routing
+                }
+                openai_tools.append(openai_tool)
+            
+            logger.info(f"Discovered {len(openai_tools)} tools from mcp_toolbox")
+            return openai_tools
+            
+    except httpx.ConnectError:  # type: ignore[union-attr]
+        logger.debug(f"mcp_toolbox not available at {toolbox_url}")
+        return []
+    except Exception as e:
+        logger.warning(f"Failed to fetch mcp_toolbox tools: {e}")
+        return []
+
+
 async def discover_all_tools(
     force_refresh: bool = False,
     selected_servers: list[str] | None = None
@@ -185,6 +253,12 @@ async def discover_all_tools(
     # Add Roo Code's built-in tools
     discovered_tools["roo_code"] = _get_roo_code_tools()
     logger.info(f"Added {len(discovered_tools['roo_code'])} Roo Code built-in tools")
+    
+    # Add mcp_toolbox tools
+    toolbox_tools = await _get_mcp_toolbox_tools()
+    if toolbox_tools:
+        discovered_tools["mcp_toolbox"] = toolbox_tools
+        logger.info(f"Added {len(toolbox_tools)} mcp_toolbox tools")
     
     # Load MCP server configurations dynamically
     mcp_loader = get_mcp_loader()
