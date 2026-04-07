@@ -13,53 +13,12 @@ from typing import Any
 from loguru import logger
 
 from src.mcp.bridge_client import list_tools_for_server
+from src.utils.dynamic_mcp_loader import get_mcp_loader
 
 
 # Cache for discovered tools (refreshed periodically)
 _TOOL_CACHE: dict[str, list[dict[str, Any]]] = {}
 _CACHE_VERSION: int = 0
-
-
-def _load_bridge_config() -> dict[str, Any]:
-    """Load MCP bridge configuration with auto-discovery fallback."""
-    config_path = Path("mcp_abacus_proxy_config.json")
-    
-    # Try manual config first
-    if config_path.exists():
-        try:
-            with open(config_path) as f:
-                return json.load(f)
-        except Exception as e:
-            logger.error(f"Failed to load bridge config: {e}")
-            return {}
-    
-    # Fallback to auto-discovery
-    logger.info("Manual config not found, attempting auto-discovery from Roo's MCP settings")
-    try:
-        from src.utils.mcp_auto_discovery import auto_discover_mcp_servers
-        
-        # Exclude model-proxy to avoid circular dependency
-        exclude_servers = ["model-proxy"]
-        
-        # Get workspace folder from environment or cwd
-        workspace_folder = os.getenv("WORKSPACE_FOLDER") or os.getcwd()
-        
-        auto_config = auto_discover_mcp_servers(
-            workspace_folder=workspace_folder,
-            exclude_servers=exclude_servers,
-        )
-        
-        if auto_config:
-            server_count = len(auto_config.get("mcp_bridge", {}).get("server_allowlist", []))
-            logger.info(f"Auto-discovered {server_count} MCP servers from Roo config")
-            return auto_config
-        else:
-            logger.warning("Auto-discovery returned no servers")
-            return {}
-        
-    except Exception as e:
-        logger.warning(f"MCP auto-discovery failed: {e}")
-        return {}
 
 
 def _get_roo_code_tools() -> list[dict[str, Any]]:
@@ -199,11 +158,15 @@ def _get_roo_code_tools() -> list[dict[str, Any]]:
     ]
 
 
-async def discover_all_tools(force_refresh: bool = False) -> dict[str, list[dict[str, Any]]]:
-    """Discover tools from all configured MCP servers and Roo Code.
+async def discover_all_tools(
+    force_refresh: bool = False,
+    selected_servers: list[str] | None = None
+) -> dict[str, list[dict[str, Any]]]:
+    """Discover tools from configured MCP servers and Roo Code.
     
     Args:
         force_refresh: Force refresh of cached tools
+        selected_servers: Optional list of specific servers to discover (None = all)
         
     Returns:
         Dictionary mapping server names to their tool lists
@@ -212,7 +175,7 @@ async def discover_all_tools(force_refresh: bool = False) -> dict[str, list[dict
     global _TOOL_CACHE, _CACHE_VERSION
     
     # Return cached tools if available and not forcing refresh
-    if _TOOL_CACHE and not force_refresh:
+    if _TOOL_CACHE and not force_refresh and selected_servers is None:
         logger.debug(f"Using cached tools (version {_CACHE_VERSION})")
         return _TOOL_CACHE
     
@@ -223,20 +186,26 @@ async def discover_all_tools(force_refresh: bool = False) -> dict[str, list[dict
     discovered_tools["roo_code"] = _get_roo_code_tools()
     logger.info(f"Added {len(discovered_tools['roo_code'])} Roo Code built-in tools")
     
-    # Load bridge configuration
-    bridge_config = _load_bridge_config()
+    # Load MCP server configurations dynamically
+    mcp_loader = get_mcp_loader()
     
-    # Get server allowlist from mcp_bridge config
-    mcp_bridge = bridge_config.get("mcp_bridge", {})
-    allowlist = mcp_bridge.get("server_allowlist", [])
+    # Get list of servers to discover
+    if selected_servers is None:
+        # Discover all available servers
+        server_list = mcp_loader.get_all_server_names()
+        logger.info(f"Discovering tools from all {len(server_list)} configured servers")
+    else:
+        # Only discover selected servers
+        server_list = selected_servers
+        logger.info(f"Discovering tools from {len(server_list)} selected servers")
     
-    # Discover tools from each allowlisted MCP server
-    for server_name in allowlist:
-        # Server config is at root level, not under "servers"
-        server_config = bridge_config.get(server_name)
-        if not server_config or not isinstance(server_config, dict):
-            logger.warning(f"No config found for allowlisted server: {server_name}")
+    # Discover tools from each MCP server
+    for server_name in server_list:
+        server_config = mcp_loader.get_server_config(server_name)
+        if not server_config:
+            logger.warning(f"No config found for server: {server_name}")
             continue
+            
         try:
             logger.debug(f"Discovering tools from server: {server_name}")
             tools = await list_tools_for_server(server_name)
@@ -253,9 +222,10 @@ async def discover_all_tools(force_refresh: bool = False) -> dict[str, list[dict
             logger.error(f"Failed to discover tools from {server_name}: {e}")
             continue
     
-    # Update cache
-    _TOOL_CACHE = discovered_tools
-    _CACHE_VERSION += 1
+    # Update cache only if discovering all servers
+    if selected_servers is None:
+        _TOOL_CACHE = discovered_tools
+        _CACHE_VERSION += 1
     
     total_tools = sum(len(tools) for tools in discovered_tools.values())
     logger.info(f"Tool discovery complete: {total_tools} tools from {len(discovered_tools)} sources")

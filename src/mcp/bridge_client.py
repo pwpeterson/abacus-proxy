@@ -58,16 +58,16 @@ def _expand_vars(value: str) -> str:
 
 
 def _load_mcp_config() -> dict[str, Any]:
-    """Load MCP configuration with auto-discovery fallback.
+    """Load MCP configuration with dynamic loader fallback.
     
     Priority:
-    1. Manual config file (mcp_abacus_proxy_config.json)
-    2. Auto-discovery from Roo's MCP settings
+    1. Manual config file (mcp_abacus_proxy_config.json) - DEPRECATED
+    2. Dynamic loader from global + project settings
     """
     cfg_path = os.getenv("MCP_ABACUS_PROXY_CONFIG_PATH", "mcp_abacus_proxy_config.json")
     p = Path(cfg_path)
     
-    # Try manual config first
+    # Try manual config first (deprecated but still supported)
     if p.exists():
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
@@ -85,40 +85,34 @@ def _load_mcp_config() -> dict[str, Any]:
                 {"error_type": "config_error", "path": str(cfg_path), "detail": str(e)},
             ) from e
     
-    # Fallback to auto-discovery
+    # Use dynamic loader (loads from global + project settings)
     try:
-        from src.utils.mcp_auto_discovery import auto_discover_mcp_servers
+        from src.utils.dynamic_mcp_loader import get_mcp_loader
         
-        # Exclude model-proxy to avoid circular dependency
-        exclude_servers = ["model-proxy"]
+        loader = get_mcp_loader()
+        all_servers = loader.load_all_servers()
         
-        # Get workspace folder from environment or cwd
-        workspace_folder = os.getenv("WORKSPACE_FOLDER") or os.getcwd()
-        
-        auto_config = auto_discover_mcp_servers(
-            workspace_folder=workspace_folder,
-            exclude_servers=exclude_servers,
-        )
-        
-        if auto_config:
-            # Log auto-discovery success
-            from loguru import logger
-            server_count = len(auto_config.get("mcp_bridge", {}).get("server_allowlist", []))
-            logger.info(f"Auto-discovered {server_count} MCP servers from Roo config")
-            return auto_config
+        if all_servers:
+            # Convert to bridge config format
+            return {
+                "mcp_bridge": {
+                    "server_allowlist": list(all_servers.keys())
+                },
+                **all_servers  # Add all server configs at root level
+            }
         
     except Exception as e:
-        # Auto-discovery failed, but don't crash - just log warning
+        # Dynamic loader failed
         try:
             from loguru import logger
-            logger.warning(f"MCP auto-discovery failed: {e}")
+            logger.warning(f"MCP dynamic loader failed: {e}")
         except Exception:
             pass
     
     # No config available
     raise MCPToolError(
         -32603,
-        f"MCP config not found: {cfg_path} (auto-discovery also failed)",
+        f"MCP config not found: {cfg_path} (dynamic loader also failed)",
         {"error_type": "config_error", "path": str(cfg_path)},
     )
 

@@ -1,49 +1,52 @@
 {
-  "mindscape-ai": {
-    "type": "stdio",
-    "command": "/bin/bash",
-    "args": [
-      "-c",
-      "set -euo pipefail; cd /home/pwp/srv/apps/mindscape-ai; set -a; source <(grep -E '^(SUPABASE_URL|SUPABASE_PUBLIC_URL|API_EXTERNAL_URL|SUPABASE_SERVICE_ROLE_KEY|SERVICE_ROLE_KEY|SERVICE_KEY)=' ./supabase.env); set +a; export SUPABASE_URL=\"${SUPABASE_PUBLIC_URL:-${API_EXTERNAL_URL:-${SUPABASE_URL:-http://localhost:8000}}}\"; export SUPABASE_SERVICE_ROLE_KEY=\"${SUPABASE_SERVICE_ROLE_KEY:-${SERVICE_ROLE_KEY:-${SERVICE_KEY:-}}}\"; exec uv run --directory /home/pwp/srv/apps/mindscape-ai python -m mindscape_ai.mcp_server"
-    ],
-    "disabled": false
-  },
-  "mem0-mcp": {
-    "type": "stdio",
-    "command": "uv",
-    "args": [
-      "run",
-      "--directory",
-      "/home/pwp/srv/mcps/mem0-mcp",
-      "python",
-      "-m",
-      "mem0_mcp.server"
-    ],
-    "disabled": false
+  "mcp_bridge": {
+    "server_allowlist": [
+      "conport",
+      "mcp-git-tools",
+      "browser-tools-mcp",
+      "svelte",
+      "fetch-mcp",
+      "model-proxy",
+      "mcp-crawl4ai-rag",
+      "chrome-devtools",
+      "brave-search",
+      "sequentialthinking",
+      "context7",
+      "puppeteer",
+      "sqlite",
+      "filesystem",
+      "mem0-mcp",
+      "mindscape-ai",
+      "mcp-toolbox"
+    ]
   },
   "conport": {
-    "type": "stdio",
+    "transport": "stdio",
     "command": "uv",
     "args": [
       "run",
       "--directory",
       "/home/pwp/srv/context-portal",
-      "conport-mcp",
+      "python",
+      "-m",
+      "context_portal_mcp.main",
       "--mode",
       "stdio",
       "--workspace_id",
       "/home/pwp/srv/apps/abacus-proxy",
       "--db-path",
-      "/home/pwp/srv/apps/abacus-proxy/context_portal/context.db",
+      "context_portal/context.db",
+      "--workspace-search-start",
+      ".",
       "--log-file",
-      "/home/pwp/srv/apps/abacus-proxy/context_portal/logs/conport.log",
+      "context_portal/logs/conport.log",
       "--log-level",
       "DEBUG"
     ],
-    "disabled": false
+    "timeout": 180
   },
   "mcp-git-tools": {
-    "type": "stdio",
+    "transport": "stdio",
     "command": "uv",
     "args": [
       "run",
@@ -54,24 +57,143 @@
       "--workspace_id",
       "/home/pwp/srv/apps/abacus-proxy"
     ],
-    "disabled": false
-  },
-  "mcp_bridge": {
-    "enabled": true,
-    "server_allowlist": [
-      "mindscape-ai",
-      "mem0-mcp",
-      "conport",
-      "mcp-git-tools"
-    ],
-    "defaults": {
-      "timeout_ms": 30000,
-      "connect_timeout_ms": 5000,
-      "max_concurrent": 5
-    },
-    "schema_validation": {
-      "enabled": true,
-      "live_cache_ttl_seconds": 300
+    "env": {
+      "MODEL_PROXY_URL": "http://localhost:8002"
     }
+  },
+  "browser-tools-mcp": {
+    "transport": "stdio",
+    "command": "npx",
+    "args": [
+      "-y",
+      "@agentdeskai/browser-tools-mcp"
+    ]
+  },
+  "svelte": {
+    "transport": "stdio",
+    "command": "npx",
+    "args": [
+      "-y",
+      "@sveltejs/mcp"
+    ]
+  },
+  "fetch-mcp": {
+    "transport": "stdio",
+    "command": "node",
+    "args": [
+      "/home/pwp/srv/mcps/fetch-mcp/dist/index.js"
+    ]
+  },
+  "model-proxy": {
+    "transport": "stdio",
+    "command": "websocat",
+    "args": [
+      "-E",
+      "ws://localhost:9002"
+    ]
+  },
+  "mcp-crawl4ai-rag": {
+    "transport": "sse",
+    "url": "http://localhost:8765/sse"
+  },
+  "chrome-devtools": {
+    "transport": "stdio",
+    "command": "npx",
+    "args": [
+      "chrome-devtools-mcp@latest",
+      "-",
+      "channel=canary",
+      "-",
+      "headless=true",
+      "-",
+      "isolated=true"
+    ]
+  },
+  "brave-search": {
+    "transport": "stdio",
+    "command": "npx",
+    "args": [
+      "-y",
+      "@modelcontextprotocol/server-brave-search"
+    ]
+  },
+  "sequentialthinking": {
+    "transport": "stdio",
+    "command": "npx",
+    "args": [
+      "-y",
+      "@modelcontextprotocol/server-sequential-thinking"
+    ]
+  },
+  "context7": {
+    "transport": "stdio",
+    "command": "npx",
+    "args": [
+      "-y",
+      "@upstash/context7-mcp"
+    ]
+  },
+  "puppeteer": {
+    "transport": "stdio",
+    "command": "npx",
+    "args": [
+      "-y",
+      "@modelcontextprotocol/server-puppeteer"
+    ]
+  },
+  "sqlite": {
+    "transport": "stdio",
+    "command": "uvx",
+    "args": [
+      "mcp-server-sqlite",
+      "--db-path",
+      "/home/pwp/srv/databases/sqlite/mytest.db"
+    ]
+  },
+  "filesystem": {
+    "transport": "stdio",
+    "command": "npx",
+    "args": [
+      "-y",
+      "@modelcontextprotocol/server-filesystem",
+      "/home/pwp/srv/apps/abacus-proxy",
+      "/home/pwp/srv/"
+    ]
+  },
+  "mem0-mcp": {
+    "transport": "stdio",
+    "command": "uv",
+    "args": [
+      "run",
+      "--directory",
+      "/home/pwp/srv/mcps/mem0-mcp",
+      "python",
+      "-m",
+      "mem0_mcp.server"
+    ],
+    "env": {
+      "MEM0_QDRANT_HOST": "localhost",
+      "MEM0_DEFAULT_APP_ID": "abacus-proxy"
+    }
+  },
+  "mindscape-ai": {
+    "transport": "stdio",
+    "command": "/bin/bash",
+    "args": [
+      "-c",
+      "set -euo pipefail; cd /home/pwp/srv/apps/mindscape-ai; set -a; source <(grep -E '^(SUPABASE_URL|SUPABASE_PUBLIC_URL|API_EXTERNAL_URL|SUPABASE_SERVICE_ROLE_KEY|SERVICE_ROLE_KEY|SERVICE_KEY)=' ./supabase.env); set +a; export SUPABASE_URL=\"${SUPABASE_PUBLIC_URL:-${API_EXTERNAL_URL:-${SUPABASE_URL:-http://localhost:8000}}}\"; export SUPABASE_SERVICE_ROLE_KEY=\"${SUPABASE_SERVICE_ROLE_KEY:-${SERVICE_ROLE_KEY:-${SERVICE_KEY:-}}}\"; exec /home/pwp/.local/bin/uv run --directory /home/pwp/srv/apps/mindscape-ai python -m mindscape_ai.mcp_server"
+    ],
+    "env": {
+      "MINDSCAPE_MCP_APP_ID": "abacus-proxy",
+      "MINDSCAPE_MCP_DB": "context_portal/context.db",
+      "MINDSCAPE_MCP_USER_ID": "default",
+      "MINDSCAPE_MCP_PROJECT_ID": "",
+      "MINDSCAPE_MCP_PROMPTS_MAX_FILE_BYTES": "200000",
+      "MINDSCAPE_APPS_WRITE": "true"
+    }
+  },
+  "mcp-toolbox": {
+    "transport": "sse",
+    "url": "http://localhost:8765/sse"
   }
 }
