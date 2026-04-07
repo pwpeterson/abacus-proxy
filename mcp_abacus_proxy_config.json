@@ -1,0 +1,81 @@
+{
+  "mindscape-ai": {
+    "type": "stdio",
+    "command": "/bin/bash",
+    "args": [
+      "-lc",
+      "set -euo pipefail; cd /home/pwp/srv/apps/mindscape-ai; set -a; source <(grep -E '^(SUPABASE_URL|SUPABASE_PUBLIC_URL|API_EXTERNAL_URL|SUPABASE_SERVICE_ROLE_KEY|SERVICE_ROLE_KEY|SERVICE_KEY)=' ./supabase.env); set +a; export SUPABASE_URL=\"${SUPABASE_PUBLIC_URL:-${API_EXTERNAL_URL:-${SUPABASE_URL:-http://localhost:8000}}}\"; export SUPABASE_SERVICE_ROLE_KEY=\"${SUPABASE_SERVICE_ROLE_KEY:-${SERVICE_ROLE_KEY:-${SERVICE_KEY:-}}}\"; exec /home/pwp/.local/bin/uv run --directory /home/pwp/srv/apps/mindscape-ai python -m mindscape_ai.mcp_server"
+    ],
+    "disabled": false
+  },
+  "mem0-mcp": {
+    "type": "stdio",
+    "command": "uv",
+    "args": [
+      "run",
+      "--directory",
+      "/home/pwp/srv/mcps/mem0-mcp",
+      "python",
+      "-m",
+      "mem0_mcp.server"
+    ],
+    "disabled": false
+  },
+  "conport": {
+    "type": "stdio",
+    "command": "uv",
+    "args": [
+      "run",
+      "--directory",
+      "/home/pwp/srv/context-portal",
+      "python",
+      "-m",
+      "context_portal_mcp.main",
+      "--mode",
+      "stdio",
+      "--workspace_id",
+      "/home/pwp/srv/apps/abacus-proxy",
+      "--db-path",
+      "context_portal/context.db",
+      "--workspace-search-start",
+      ".",
+      "--log-file",
+      "context_portal/logs/conport.log",
+      "--log-level",
+      "DEBUG"
+    ],
+    "disabled": false
+  },
+  "mcp-git-tools": {
+    "type": "stdio",
+    "command": "uv",
+    "args": [
+      "run",
+      "--directory",
+      "/home/pwp/srv/mcps/mcp-git-tools",
+      "python",
+      "mcp-git-tools.py",
+      "--workspace_id",
+      "/home/pwp/srv/apps/abacus-proxy"
+    ],
+    "disabled": false
+  },
+  "mcp_bridge": {
+    "enabled": true,
+    "server_allowlist": [
+      "mindscape-ai",
+      "mem0-mcp",
+      "conport",
+      "mcp-git-tools"
+    ],
+    "defaults": {
+      "timeout_ms": 30000,
+      "connect_timeout_ms": 5000,
+      "max_concurrent": 5
+    },
+    "schema_validation": {
+      "enabled": true,
+      "live_cache_ttl_seconds": 300
+    }
+  }
+}
