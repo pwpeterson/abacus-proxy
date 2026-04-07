@@ -165,65 +165,105 @@ def _get_roo_code_tools() -> list[dict[str, Any]]:
     ]
 
 
-async def _get_mcp_toolbox_tools() -> list[dict[str, Any]]:
-    """Get tools from mcp_toolbox HTTP endpoint.
+# HTTP-based MCP servers configuration
+# Maps server name to (default_url, env_var_name)
+HTTP_MCP_SERVERS = {
+    "mcp_toolbox": ("http://127.0.0.1:8004/tools", "MCP_TOOLBOX_URL"),
+    "mcp-crawl4ai-rag": ("http://localhost:8051/tools", "MCP_CRAWL4AI_RAG_URL"),
+}
+
+
+async def _get_http_mcp_tools(server_name: str, url: str) -> list[dict[str, Any]]:
+    """Get tools from an HTTP MCP endpoint.
     
-    Fetches the tool list from http://127.0.0.1:8004/tools and converts
-    to OpenAI function calling format.
+    Fetches the tool list from the specified URL and converts to OpenAI function calling format.
+    
+    Args:
+        server_name: Name of the MCP server (for routing metadata)
+        url: HTTP endpoint URL to fetch tools from
     
     Returns:
         List of tools in OpenAI format, or empty list if unavailable
     """
     if not _HTTPX_AVAILABLE or httpx is None:
-        logger.warning("httpx not available, skipping mcp_toolbox discovery")
+        logger.warning(f"httpx not available, skipping {server_name} discovery")
         return []
-    
-    toolbox_url = os.getenv("MCP_TOOLBOX_URL", "http://127.0.0.1:8004/tools")
     
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:  # type: ignore[union-attr]
-            response = await client.get(toolbox_url)
+            response = await client.get(url)
             
             if response.status_code != 200:
-                logger.warning(f"mcp_toolbox returned status {response.status_code}")
+                logger.warning(f"{server_name} returned status {response.status_code}")
                 return []
             
             tools_data = response.json()
             
-            if not isinstance(tools_data, list):
-                logger.warning(f"mcp_toolbox returned non-list: {type(tools_data)}")
+            # Handle both list format and dict with 'tools' key
+            if isinstance(tools_data, dict) and "tools" in tools_data:
+                tools_list = tools_data["tools"]
+            elif isinstance(tools_data, list):
+                tools_list = tools_data
+            else:
+                logger.warning(f"{server_name} returned unexpected format: {type(tools_data)}")
+                return []
+            
+            if not isinstance(tools_list, list):
+                logger.warning(f"{server_name} tools is not a list: {type(tools_list)}")
                 return []
             
             # Convert to OpenAI function calling format
             openai_tools = []
-            for tool in tools_data:
+            for tool in tools_list:
                 if not isinstance(tool, dict) or "name" not in tool:
                     continue
+                
+                # Use inputSchema if available, otherwise empty schema
+                parameters = tool.get("inputSchema", {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                })
                 
                 openai_tool = {
                     "type": "function",
                     "function": {
                         "name": tool["name"],
                         "description": tool.get("description", ""),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {},
-                            "required": []
-                        }
+                        "parameters": parameters
                     },
-                    "_mcp_server": "mcp_toolbox"  # Internal metadata for routing
+                    "_mcp_server": server_name  # Internal metadata for routing
                 }
                 openai_tools.append(openai_tool)
             
-            logger.info(f"Discovered {len(openai_tools)} tools from mcp_toolbox")
+            logger.info(f"Discovered {len(openai_tools)} tools from {server_name} via HTTP")
             return openai_tools
             
     except httpx.ConnectError:  # type: ignore[union-attr]
-        logger.debug(f"mcp_toolbox not available at {toolbox_url}")
+        logger.debug(f"{server_name} not available at {url}")
         return []
     except Exception as e:
-        logger.warning(f"Failed to fetch mcp_toolbox tools: {e}")
+        logger.warning(f"Failed to fetch {server_name} tools: {e}")
         return []
+
+
+async def _discover_http_mcp_servers() -> dict[str, list[dict[str, Any]]]:
+    """Discover tools from all configured HTTP-based MCP servers.
+    
+    Returns:
+        Dictionary mapping server names to their tool lists
+    """
+    discovered = {}
+    
+    for server_name, (default_url, env_var) in HTTP_MCP_SERVERS.items():
+        # Allow environment variable override
+        url = os.getenv(env_var, default_url)
+        tools = await _get_http_mcp_tools(server_name, url)
+        
+        if tools:
+            discovered[server_name] = tools
+    
+    return discovered
 
 
 async def discover_all_tools(
@@ -254,11 +294,9 @@ async def discover_all_tools(
     discovered_tools["roo_code"] = _get_roo_code_tools()
     logger.info(f"Added {len(discovered_tools['roo_code'])} Roo Code built-in tools")
     
-    # Add mcp_toolbox tools
-    toolbox_tools = await _get_mcp_toolbox_tools()
-    if toolbox_tools:
-        discovered_tools["mcp_toolbox"] = toolbox_tools
-        logger.info(f"Added {len(toolbox_tools)} mcp_toolbox tools")
+    # Add HTTP-based MCP server tools
+    http_servers = await _discover_http_mcp_servers()
+    discovered_tools.update(http_servers)
     
     # Load MCP server configurations dynamically
     mcp_loader = get_mcp_loader()
