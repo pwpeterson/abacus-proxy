@@ -1,0 +1,85 @@
+# Patch to add comprehensive debug logging to abacus-proxy chat completions endpoint
+# This will show:
+# 1. Incoming request tools from Roo Code
+# 2. Upstream response from RouteLLM
+# 3. Transformed response sent back to Roo Code
+
+# Add this logging to src/app_fastapi.py in the chat_completions function
+
+# After line ~996 (after "Proxying /v1/chat/completions to upstream...")
+# Add:
+
+        # DEBUG: Log incoming tools from client
+        client_tools = payload.get("tools")
+        if client_tools:
+            logger.info(
+                f"[DEBUG] Client sent {len(client_tools)} tools. "
+                f"First 3 tool names: {[t.get('function', {}).get('name') for t in client_tools[:3]]}"
+            )
+            # Log first tool's full schema for inspection
+            if client_tools:
+                first_tool = client_tools[0]
+                logger.info(f"[DEBUG] First tool full schema: {json.dumps(first_tool, indent=2)}")
+
+# After line ~1010 (after "Upstream non-stream responded...")
+# Add:
+
+            # DEBUG: Log upstream response
+            logger.info(f"[DEBUG] Upstream response status: {r.status_code}")
+            try:
+                upstream_data = r.json()
+                
+                # Log response structure
+                choices = upstream_data.get("choices", [])
+                if choices:
+                    first_choice = choices[0]
+                    message = first_choice.get("message", {})
+                    
+                    logger.info(
+                        f"[DEBUG] Upstream response: "
+                        f"has_content={message.get('content') is not None}, "
+                        f"has_tool_calls={message.get('tool_calls') is not None}"
+                    )
+                    
+                    # If tool calls exist, log them
+                    tool_calls = message.get("tool_calls")
+                    if tool_calls:
+                        logger.info(f"[DEBUG] Upstream returned {len(tool_calls)} tool calls")
+                        for i, tc in enumerate(tool_calls[:3]):  # Log first 3
+                            func = tc.get("function", {})
+                            logger.info(
+                                f"[DEBUG] Tool call {i}: "
+                                f"name={func.get('name')}, "
+                                f"args_preview={func.get('arguments', '')[:100]}"
+                            )
+                    
+                    # Log full first tool call for inspection
+                    if tool_calls:
+                        logger.info(f"[DEBUG] First tool call full: {json.dumps(tool_calls[0], indent=2)}")
+                
+                # Store for later comparison
+                original_upstream_data = upstream_data.copy()
+                
+            except Exception as e:
+                logger.error(f"[DEBUG] Failed to parse upstream response: {e}")
+
+# After the _rewrite_text_only_to_attempt_completion call
+# Add:
+
+                # DEBUG: Log if rewrite happened
+                if data != original_upstream_data:
+                    logger.info("[DEBUG] Response was rewritten (text-only -> attempt_completion)")
+                    new_tool_calls = data.get("choices", [{}])[0].get("message", {}).get("tool_calls")
+                    if new_tool_calls:
+                        logger.info(f"[DEBUG] Rewritten tool call: {json.dumps(new_tool_calls[0], indent=2)}")
+                
+                # DEBUG: Log final response being sent to client
+                final_choices = data.get("choices", [])
+                if final_choices:
+                    final_message = final_choices[0].get("message", {})
+                    final_tool_calls = final_message.get("tool_calls")
+                    if final_tool_calls:
+                        logger.info(
+                            f"[DEBUG] Sending {len(final_tool_calls)} tool calls to client. "
+                            f"Names: {[tc.get('function', {}).get('name') for tc in final_tool_calls]}"
+                        )

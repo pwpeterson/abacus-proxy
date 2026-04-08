@@ -11,6 +11,8 @@ Design goals:
 
 from __future__ import annotations
 
+import hashlib
+from functools import lru_cache
 from typing import Any
 
 from loguru import logger
@@ -49,10 +51,49 @@ def detect_provider(model: str) -> str:
 
 
 def estimate_tokens(text: str) -> int:
-    """Heuristic fallback when no tokenizer is available."""
+    """Improved heuristic fallback when no tokenizer is available.
+    
+    Accounts for common patterns that affect token density:
+    - Code blocks are denser (more tokens per char)
+    - JSON/structured data is denser
+    - Natural language is sparser
+    """
     s = text if isinstance(text, str) else str(text)
-    # Conservative heuristic: ~ 3.5 chars/token + some overhead.
-    return int(len(s) / 3.5) + 1
+    
+    # Base calculation
+    base_chars_per_token = 3.5
+    
+    # Detect code blocks
+    code_blocks = s.count("```")
+    # Detect JSON/structured data
+    json_chars = s.count("{") + s.count("[") + s.count(":")
+    # Detect whitespace density (code has more)
+    whitespace_ratio = s.count(" ") / max(len(s), 1)
+    
+    # Adjust chars/token ratio based on content type
+    if code_blocks > 0:
+        # Code is denser: ~3.0 chars/token
+        base_chars_per_token = 3.0
+    elif json_chars > 10:
+        # JSON is denser: ~3.2 chars/token
+        base_chars_per_token = 3.2
+    elif whitespace_ratio > 0.15:
+        # High whitespace (likely code): ~3.3 chars/token
+        base_chars_per_token = 3.3
+    
+    return int(len(s) / base_chars_per_token) + 1
+
+
+@lru_cache(maxsize=1024)
+def _cached_estimate_tokens(text: str, model: str) -> int:
+    """Cached token estimation for repeated content.
+    
+    This is particularly useful for:
+    - System messages that appear in every request
+    - Rules that are injected repeatedly
+    - Tool schemas that don't change
+    """
+    return estimate_tokens_by_provider(text, model)
 
 
 def estimate_tokens_openai(text: str, model: str = "gpt-4") -> int:
@@ -122,12 +163,21 @@ def estimate_messages_tokens(
     *,
     tools: list[dict[str, Any]] | None = None,
     provider: str | None = None,
+    use_cache: bool = True,
 ) -> int:
     """Estimate total tokens for chat messages (+ optional tools).
 
     Notes:
     - Adds small per-message overhead to approximate chat framing.
     - Treats non-string content as str(...) for estimation stability.
+    - Uses caching for repeated content when use_cache=True.
+    
+    Args:
+        messages: List of chat messages
+        model: Model ID for provider-specific estimation
+        tools: Optional tool schemas
+        provider: Optional provider override
+        use_cache: Whether to use cached estimates (default True)
     """
     if not isinstance(messages, list):
         return 0
@@ -149,8 +199,13 @@ def estimate_messages_tokens(
             content = str(content)
 
         if model:
-            total += estimate_tokens_by_provider(role, model)
-            total += estimate_tokens_by_provider(content, model)
+            if use_cache:
+                # Use cached estimation for repeated content (e.g., system messages)
+                total += _cached_estimate_tokens(role, model)
+                total += _cached_estimate_tokens(content, model)
+            else:
+                total += estimate_tokens_by_provider(role, model)
+                total += estimate_tokens_by_provider(content, model)
         else:
             total += estimate_tokens(role)
             total += estimate_tokens(content)

@@ -24,6 +24,40 @@ class AppConfig(BaseModel):
     log_dir: Path = Field(default=Path("logs"))
 
     # ---------------------------------------------------------------------
+    # Wire-level payload logging (debugging Roo ↔ abacus-proxy ↔ upstream)
+    #
+    # SECURITY:
+    # - Payload logging is redacted best-effort, but still risky (PII may exist).
+    # - Keep disabled by default. Prefer summaries unless debugging.
+    # ---------------------------------------------------------------------
+    enable_wire_logging: bool = Field(
+        default=False,
+        description="Enable wire-level request/response logging (summaries + correlation IDs)",
+    )
+    wire_log_include_payloads: bool = Field(
+        default=False,
+        description="Include truncated redacted JSON payload blobs in logs (very noisy)",
+    )
+    wire_log_max_chars: int = Field(
+        default=8000,
+        ge=500,
+        le=200_000,
+        description="Max chars for any logged payload JSON blob",
+    )
+    wire_log_max_list_items: int = Field(
+        default=50,
+        ge=1,
+        le=500,
+        description="Max list items to include when logging/redacting payloads",
+    )
+
+    # Legacy debug flag used in some code paths; treat as an alias for enable_wire_logging.
+    enable_raw_response_logging: bool = Field(
+        default=False,
+        description="Legacy alias for enable_wire_logging (kept for compatibility)",
+    )
+
+    # ---------------------------------------------------------------------
     # Upstream RouteLLM (single target)
     #
     # For local deployments, this should be the full OpenAI-compatible API base

@@ -18,8 +18,24 @@ def setup_logging(
     enable_rich: bool = True,
     enable_structured: bool = True,
     app_name: str = "app",
+    rotation_size: str = "10 MB",
+    retention_days: int = 7,
+    error_retention_days: int = 14,
+    redact_headers: list[str] | None = None,
 ) -> None:
-    """Configure logging with structured JSON and human-readable formats."""
+    """Configure logging with structured JSON and human-readable formats.
+    
+    Args:
+        log_dir: Directory for log files
+        log_level: Minimum log level for console output
+        enable_rich: Use rich console formatting
+        enable_structured: Enable structured JSON logs
+        app_name: Application name for log files
+        rotation_size: Log file rotation size (e.g., '10 MB')
+        retention_days: Days to retain regular logs
+        error_retention_days: Days to retain error logs
+        redact_headers: List of header names to redact from logs
+    """
     # Remove default handler
     logger.remove()
 
@@ -32,8 +48,8 @@ def setup_logging(
     if enable_structured:
         logger.add(
             log_dir / f"{app_name}.jsonl",
-            rotation="10 MB",
-            retention="7 days",
+            rotation=rotation_size,
+            retention=f"{retention_days} days",
             level="DEBUG",
             format="{message}",
             serialize=True,
@@ -44,8 +60,8 @@ def setup_logging(
 
         logger.add(
             log_dir / f"{app_name}_errors.jsonl",
-            rotation="5 MB",
-            retention="14 days",
+            rotation=rotation_size,
+            retention=f"{error_retention_days} days",
             level="ERROR",
             format="{message}",
             serialize=True,
@@ -64,8 +80,8 @@ def setup_logging(
 
     logger.add(
         log_dir / f"{app_name}.log",
-        rotation="10 MB",
-        retention="7 days",
+        rotation=rotation_size,
+        retention=f"{retention_days} days",
         level="DEBUG",
         format=human_log_format,
         backtrace=True,
@@ -76,8 +92,8 @@ def setup_logging(
 
     logger.add(
         log_dir / f"{app_name}_errors.log",
-        rotation="5 MB",
-        retention="14 days",
+        rotation=rotation_size,
+        retention=f"{error_retention_days} days",
         level="ERROR",
         format=human_log_format,
         backtrace=True,

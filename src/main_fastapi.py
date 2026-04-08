@@ -28,12 +28,18 @@ mcp_task: asyncio.Task | None = None
 config: AppConfig = load_app_config()
 
 # Setup logging (structured logs are useful under systemd/podman)
+import os
+
 setup_logging(
     log_dir=config.log_dir,
     log_level=config.log_level,
     enable_rich=False,
     enable_structured=True,
     app_name="abacus_proxy",
+    rotation_size=os.getenv("LOG_ROTATION_SIZE", "10 MB"),
+    retention_days=int(os.getenv("LOG_RETENTION_DAYS", "7")),
+    error_retention_days=int(os.getenv("ERROR_LOG_RETENTION_DAYS", "14")),
+    redact_headers=os.getenv("LOG_REDACT_HEADERS", "Authorization,X-API-Key").split(","),
 )
 
 logger.bind(

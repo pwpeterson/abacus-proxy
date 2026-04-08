@@ -31,10 +31,7 @@ from src.utils.prompt_guard import guard_chat_messages
 from src.utils.request_logger import AbacusRequestLogger
 from src.utils.rules_prompt_injector import inject_retrieved_rules
 from src.utils.startup_indexer import auto_index_rules_on_startup
-from src.utils.tool_discovery import build_tool_map, discover_all_tools
-from src.utils.tool_filter import ToolFilter
-from src.utils.tool_schema_registry import load_tool_schema_registry, select_registry_tools_for_injection
-from src.utils.tool_selector import select_tools_for_request
+from src.utils.performance_middleware import create_performance_middleware
 
 StartupHook = Callable[[dict[str, Any]], Awaitable[None]]
 ShutdownHook = Callable[[], Awaitable[None]]
@@ -80,6 +77,10 @@ def create_app(
                 keep_recent_ratio=float(getattr(config, "keep_recent_ratio", 0.2)),
                 min_keep_messages=int(getattr(config, "min_keep_messages", 5)),
                 summary_limit=int(getattr(config, "summary_limit", 3)),
+                enable_dynamic_threshold=bool(getattr(config, "enable_dynamic_threshold", True)),
+                enable_importance_scoring=bool(getattr(config, "enable_importance_scoring", True)),
+                enable_system_compression=bool(getattr(config, "enable_system_compression", True)),
+                enable_adaptive_summary=bool(getattr(config, "enable_adaptive_summary", True)),
             )
             app.state.memory_service = memory_service
             app.state.context_manager = context_manager
@@ -103,21 +104,6 @@ def create_app(
             logger.warning(f"Mem0 services disabled (init failed): {e}")
             app.state.memory_service = None
             app.state.context_manager = None
-
-        # Load tool schema registry (best-effort)
-        tool_registry = None
-        if bool(getattr(config, "enable_tool_registry", False)):
-            try:
-                registry_path = str(getattr(config, "tool_registry_path", "./tool_schema_registry.json"))
-                tool_registry = load_tool_schema_registry(registry_path)
-                app.state.tool_registry = tool_registry
-                logger.info(f"Tool schema registry loaded from {registry_path}")
-            except Exception as e:
-                logger.warning(f"Tool schema registry disabled (load failed): {e}")
-                app.state.tool_registry = None
-        else:
-            app.state.tool_registry = None
-
         # Initialize request tracking (best-effort; do not prevent startup)
         request_logger = AbacusRequestLogger(
             enabled=bool(getattr(config, "enable_request_tracking", False)),
@@ -132,23 +118,9 @@ def create_app(
             "Request tracking initialized"
         )
 
-        # Initialize dynamic tool discovery (best-effort; do not prevent startup)
-        try:
-            logger.info("Discovering tools from MCP servers...")
-            discovered_tools = await discover_all_tools(force_refresh=True)
-            tool_map = build_tool_map(discovered_tools)
-            
-            app.state.discovered_tools = discovered_tools
-            app.state.tool_map = tool_map
-            
-            total_tools = sum(len(tools) for tools in discovered_tools.values())
-            logger.info(
-                f"Tool discovery complete: {total_tools} tools from {len(discovered_tools)} sources"
-            )
-        except Exception as e:
-            logger.error(f"Tool discovery failed (non-fatal): {e}")
-            app.state.discovered_tools = {}
-            app.state.tool_map = {}
+        # Tool discovery removed - Roo Code provides tools directly
+        app.state.discovered_tools = {}
+        app.state.tool_map = {}
 
         if on_startup:
             await on_startup(
@@ -175,6 +147,13 @@ def create_app(
     # Cache for upstream `/v1/models` to avoid hammering the upstream endpoint.
     # Only successful responses are cached.
     app.state.models_cache = {"ts": 0.0, "data": None}
+    
+    # Add performance logging middleware
+    import os
+    create_performance_middleware(
+        app,
+        enabled=os.getenv("ENABLE_PERFORMANCE_LOGGING", "true").lower() == "true",
+    )
 
     @app.get("/health")
     async def health() -> JSONResponse:  # type: ignore[reportUnusedFunction]
@@ -255,65 +234,6 @@ def create_app(
         s = s.replace("\\", "")
 
         return s.rstrip("/")
-
-    def _sanitize_json_schema(obj: Any) -> Any:
-        """Sanitize JSON Schema for upstream compatibility.
-
-        Abacus OpenAI-compatible tool validation appears stricter than OpenAI's.
-        Observed incompatibilities:
-        - JSON Schema keyword `propertyNames` is rejected.
-        - Some schema positions require an explicit `"type"` (e.g. `items: {}` is rejected
-          with "schema must have a 'type' key").
-        - Some tool definitions appear to provide primitive shorthands (e.g. `"object"`)
-          where a JSON Schema object is expected; Abacus rejects this with:
-          `'object' is not of type 'object', 'boolean'.`
-
-        Strategy:
-        - Recursively remove unsupported keywords.
-        - Coerce primitive shorthands into schema objects.
-        - Infer and add missing `"type"` when implied by keywords:
-          - `properties` => type=object
-          - `items`      => type=array
-        - Replace `{}` with `{ "type": "object" }` as a best-effort "any" schema.
-        """
-        # JSON Schema can be boolean true/false — keep as-is.
-        if isinstance(obj, bool):
-            return obj
-
-        # Coerce common shorthand strings into schema objects.
-        if isinstance(obj, str):
-            t = obj.strip().lower()
-            if t in {"object", "array", "string", "number", "integer", "boolean", "null"}:
-                return {"type": t}
-            # Unknown string -> best-effort object schema
-            return {"type": "object"}
-
-        if isinstance(obj, list):
-            return [_sanitize_json_schema(v) for v in obj]
-
-        if isinstance(obj, dict):
-            if not obj:
-                return {"type": "object"}
-
-            out: dict[str, Any] = {}
-
-            for k, v in obj.items():
-                # Upstream rejects this keyword (breaks Roo tool schemas).
-                if k == "propertyNames":
-                    continue
-                out[k] = _sanitize_json_schema(v)
-
-            # Add missing type if implied.
-            if "type" not in out:
-                if "properties" in out:
-                    out["type"] = "object"
-                elif "items" in out:
-                    out["type"] = "array"
-
-            return out
-
-        # Unknown primitive -> best-effort object schema
-        return {"type": "object"}
 
     def _rewrite_text_only_to_attempt_completion(data: Any) -> Any:
         """Rewrite text-only assistant replies into an OpenAI tool call.
@@ -934,103 +854,9 @@ def create_app(
         # Prompt guard last (it may drop old messages; should run after condensation store).
         _apply_prompt_guard(payload)
 
-        # Dynamic tool discovery and injection
-        discovered_tools = getattr(app.state, "discovered_tools", {})
-        if discovered_tools:
-            messages = payload.get("messages", [])
-            tools = payload.get("tools")
-            
-            # Server-side tool injection (when client omits tools)
-            if not tools and bool(getattr(config, "enable_tool_injection", True)):
-                max_tools = int(getattr(config, "tool_injection_max_tools", 50))
-                
-                # Use intelligent tool selection
-                mem0_context = payload.get("_mem0_context", {})
-                selected_tools = await select_tools_for_request(
-                    messages=messages,
-                    mem0_context=mem0_context,
-                    available_tools=discovered_tools,
-                    max_tools=max_tools
-                )
-                
-                if selected_tools:
-                    payload["tools"] = selected_tools
-                    logger.info(f"Injected {len(selected_tools)} dynamically selected tools")
-            
-            # Client-provided tools filtering (when client provides tools)
-            elif tools and isinstance(tools, list) and bool(getattr(config, "enable_tool_filtering", False)):
-                max_tools = int(getattr(config, "tool_filtering_max_tools", 50))
-                
-                filtered_tools, filter_stats = ToolFilter.filter_tools(
-                    tools=tools,
-                    messages=messages,
-                    max_tools=max_tools,
-                    enable_filtering=True,
-                )
-                
-                if filter_stats.get("filtered"):
-                    payload["tools"] = filtered_tools
-                    logger.info(
-                        f"Filtered tools: {filter_stats['original_count']} → {filter_stats['filtered_count']} "
-                        f"({filter_stats.get('reduction_percent', 0):.1f}% reduction)"
-                    )
-        else:
-            # Fallback to old tool registry if discovery failed
-            tool_registry = getattr(app.state, "tool_registry", None)
-            if tool_registry is not None:
-                messages = payload.get("messages", [])
-                tools = payload.get("tools")
-                
-                if not tools and bool(getattr(config, "enable_tool_injection", False)):
-                    max_tools = int(getattr(config, "tool_injection_max_tools", 20))
-                    max_tool_tokens = int(getattr(config, "tool_injection_max_tokens", 5000))
-                    
-                    injected_tools = select_registry_tools_for_injection(
-                        registry=tool_registry,
-                        messages=messages,
-                        max_tools=max_tools,
-                        max_tool_tokens=max_tool_tokens,
-                    )
-                    
-                    if injected_tools:
-                        payload["tools"] = injected_tools
-                        logger.info(f"Injected {len(injected_tools)} tools from registry (fallback)")
+        # Tool injection/filtering removed - Roo Code provides tools directly
+        # Tools are passed through from client without modification
 
-        # Sanitize tool schemas for upstream compatibility.
-        #
-        # Abacus validates tool schemas more strictly than OpenAI. We sanitize
-        # unsupported keywords and normalize shape, then ensure tool "parameters"
-        # describes an object of named arguments (OpenAI tool calling convention).
-        tools = payload.get("tools")
-        if isinstance(tools, list):
-            for tool in tools:
-                if not isinstance(tool, dict):
-                    continue
-                fn = tool.get("function")
-                if not isinstance(fn, dict):
-                    continue
-                if "parameters" in fn:
-                    sanitized = _sanitize_json_schema(fn.get("parameters"))
-
-                    # JSON Schema allows booleans; preserve them.
-                    if sanitized is True or sanitized is False:
-                        fn["parameters"] = sanitized
-                        continue
-
-                    # Abacus/OpenAI tool parameters must be an object schema describing args.
-                    # Abacus additionally requires `additionalProperties=false` at the root.
-                    if isinstance(sanitized, dict) and sanitized.get("type") == "object":
-                        params_obj = dict(sanitized)
-                    else:
-                        params_obj = {"type": "object", "properties": {}}
-
-                    if not isinstance(params_obj.get("properties"), dict):
-                        params_obj["properties"] = {}
-
-                    # Force strict args object
-                    params_obj["additionalProperties"] = False
-
-                    fn["parameters"] = params_obj
 
         # ------------------------------------------------------------------
         # Model routing / aliasing

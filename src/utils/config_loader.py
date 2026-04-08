@@ -138,11 +138,25 @@ def load_app_config() -> AppConfig:
     )
     model_value_index_family_priors = _parse_family_quality_priors(default=None)
 
+    enable_wire_logging = os.getenv("ENABLE_WIRE_LOGGING", "false").lower() == "true"
+    wire_log_include_payloads = os.getenv("WIRE_LOG_INCLUDE_PAYLOADS", "false").lower() == "true"
+    wire_log_max_chars = int(os.getenv("WIRE_LOG_MAX_CHARS", "8000"))
+    wire_log_max_list_items = int(os.getenv("WIRE_LOG_MAX_LIST_ITEMS", "50"))
+
+    # Legacy alias: some deployments used ENABLE_RAW_RESPONSE_LOGGING as a debug switch.
+    legacy_raw_logging = os.getenv("ENABLE_RAW_RESPONSE_LOGGING", "").lower() == "true"
+
     return AppConfig(
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8003")),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
         log_dir=Path(os.getenv("LOG_DIR", "logs")),
+        # Wire logging
+        enable_wire_logging=enable_wire_logging or legacy_raw_logging,
+        wire_log_include_payloads=wire_log_include_payloads,
+        wire_log_max_chars=wire_log_max_chars,
+        wire_log_max_list_items=wire_log_max_list_items,
+        enable_raw_response_logging=enable_wire_logging or legacy_raw_logging,
         # Upstream RouteLLM (single target)
         routellm_api_base_url=os.getenv("ROUTELLM_API_BASE_URL", "http://localhost:8003/v1"),
         routellm_model_id=os.getenv("ROUTELLM_MODEL_ID", "route-llm"),

@@ -20,13 +20,28 @@ from typing import Any
 import httpx
 from loguru import logger
 
+try:
+    import jsonschema
+    import jsonschema.validators as _jsonschema_validators
+    _JSONSCHEMA_AVAILABLE = True
+except ImportError:
+    jsonschema = None  # type: ignore[assignment]
+    _jsonschema_validators = None
+    _JSONSCHEMA_AVAILABLE = False
+
 from src.mcp.bridge_client import call_tool_on_server, list_tools_for_server
 from src.mcp.errors import MCPToolError
 from src.utils.code_jit_prompt_injector import inject_code_jit_context
 from src.utils.context_manager import ContextManager
 from src.utils.memory_service import MemoryService
+from src.utils.parameter_translator import translate_parameters
 from src.utils.prompt_guard import guard_chat_messages
 from src.utils.rules_prompt_injector import inject_retrieved_rules
+from src.utils.tool_schema_registry import (
+    get_registry_tool_schema,
+    load_tool_schema_registry,
+)
+from src.utils.wire_logging import dumps_json_truncated, summarize_chat_payload
 
 
 def _get_config(app_resources: dict[str, Any]) -> Any:
@@ -108,6 +123,15 @@ async def send_chat_request(
 
     upstream_model = _get_route_model_id(cfg)
 
+    # Wire-level logging controls (safe by default; redacted + truncated)
+    wire_enabled = bool(
+        getattr(cfg, "enable_wire_logging", False)
+        or getattr(cfg, "enable_raw_response_logging", False)
+    )
+    wire_include_payloads = bool(getattr(cfg, "wire_log_include_payloads", False))
+    wire_max_chars = int(getattr(cfg, "wire_log_max_chars", 8000) or 8000)
+    wire_max_list_items = int(getattr(cfg, "wire_log_max_list_items", 50) or 50)
+
     # ------------------------------------------------------------------
     # Mem0 enhancements (best-effort): rules injection, code JIT injection,
     # and Mem0-backed condensation.
@@ -123,6 +147,29 @@ async def send_chat_request(
         session_id = sid.strip()
     else:
         session_id = f"mcp_{uuid.uuid4()}"
+
+    wire_id = session_id
+    if wire_enabled:
+        inbound_view = {
+            "model": requested_model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "tools": arguments.get("tools") if isinstance(arguments.get("tools"), list) else None,
+        }
+        logger.bind(wire_id=wire_id, event="wire.mcp.inbound").debug(
+            f"[WIRE] MCP send_chat_request inbound summary={summarize_chat_payload(inbound_view)}"
+        )
+        if wire_include_payloads:
+            logger.bind(wire_id=wire_id, event="wire.mcp.inbound.payload").debug(
+                "[WIRE] MCP send_chat_request inbound payload="
+                + dumps_json_truncated(
+                    inbound_view,
+                    max_chars=wire_max_chars,
+                    max_list_items=wire_max_list_items,
+                    indent=2,
+                )
+            )
 
     ms = app_resources.get("memory_service")
     cm = app_resources.get("context_manager")
@@ -200,6 +247,18 @@ async def send_chat_request(
                     f"stored={ctx_stats.get('messages_stored')} saved={ctx_stats.get('tokens_saved')}"
                 )
 
+    if wire_enabled:
+        after_mem0_view = {
+            "model": requested_model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "tools": arguments.get("tools") if isinstance(arguments.get("tools"), list) else None,
+        }
+        logger.bind(wire_id=wire_id, event="wire.mcp.after_mem0").debug(
+            f"[WIRE] MCP after Mem0 enhancements summary={summarize_chat_payload(after_mem0_view)}"
+        )
+
     # Guard oversized prompts to avoid upstream context-window failures.
     # Run this *after* Mem0 enhancements so condensation/rewrite can happen first.
     if bool(getattr(cfg, "prompt_guard_enabled", True)):
@@ -217,6 +276,18 @@ async def send_chat_request(
                 f"original_chars={stats.original_chars} final_chars={stats.final_chars} "
                 f"dropped_messages={stats.dropped_messages} truncated_messages={stats.truncated_messages}"
             )
+
+    if wire_enabled:
+        after_guard_view = {
+            "model": requested_model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "tools": arguments.get("tools") if isinstance(arguments.get("tools"), list) else None,
+        }
+        logger.bind(wire_id=wire_id, event="wire.mcp.after_prompt_guard").debug(
+            f"[WIRE] MCP after prompt guard summary={summarize_chat_payload(after_guard_view)}"
+        )
 
     payload: dict[str, Any] = {
         "model": upstream_model,
@@ -250,6 +321,21 @@ async def send_chat_request(
 
     timeout_s = float(getattr(cfg, "upstream_timeout_seconds", 120.0))
 
+    if wire_enabled:
+        logger.bind(wire_id=wire_id, event="wire.mcp.outbound").debug(
+            f"[WIRE] MCP outbound upstream summary={summarize_chat_payload(payload)} url={url}"
+        )
+        if wire_include_payloads:
+            logger.bind(wire_id=wire_id, event="wire.mcp.outbound.payload").debug(
+                "[WIRE] MCP outbound upstream payload="
+                + dumps_json_truncated(
+                    payload,
+                    max_chars=wire_max_chars,
+                    max_list_items=wire_max_list_items,
+                    indent=2,
+                )
+            )
+
     try:
         transport = _get_upstream_transport(cfg)
         async with httpx.AsyncClient(timeout=timeout_s, transport=transport) as client:
@@ -260,6 +346,21 @@ async def send_chat_request(
             data = r.json()
         except Exception:
             data = {"raw_text": r.text}
+
+        if wire_enabled:
+            logger.bind(
+                wire_id=wire_id,
+                event="wire.mcp.upstream.response",
+                status_code=r.status_code,
+            ).debug(
+                "[WIRE] MCP upstream response="
+                + dumps_json_truncated(
+                    data,
+                    max_chars=wire_max_chars,
+                    max_list_items=wire_max_list_items,
+                    indent=2,
+                )
+            )
 
         if r.status_code >= 400:
             raise MCPToolError(
@@ -1107,6 +1208,9 @@ async def mcp_call(app_resources: dict[str, Any], arguments: dict[str, Any]) -> 
             "Parameter 'arguments' must be an object",
             {"error_type": "invalid_arguments", "server": server, "tool": tool, "call_id": call_id},
         )
+    
+    # Translate Roo Code parameter names to MCP server parameter names
+    args_payload = translate_parameters(server=server, tool=tool, arguments=args_payload)
 
     cfg = _load_abacus_proxy_mcp_config()
     bridge = _get_bridge_block(cfg)

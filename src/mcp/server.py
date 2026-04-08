@@ -51,6 +51,7 @@ class MCPServer:
         self.connections: dict[str, Any] = {}
         self.app_resources = app_resources or {}
         self.tools = self._register_tools()
+        self._bridged_tools_cache: dict[str, list[dict[str, Any]]] | None = None
 
     def _register_tools(self) -> dict[str, Any]:
         """Register available MCP tools."""
@@ -203,6 +204,77 @@ class MCPServer:
         except Exception:
             return default
 
+    async def _load_bridged_tools(self) -> list[dict[str, Any]]:
+        """Load and cache all bridged tools from configured MCP servers."""
+        if self._bridged_tools_cache is not None:
+            return self._bridged_tools_cache
+
+        bridged_tools: list[dict[str, Any]] = []
+
+        try:
+            # Get list of configured servers
+            servers_result = await mcp_list_servers(self.app_resources, {})
+            if servers_result.get("status") != "success":
+                logger.warning("[MCP] Failed to list servers for bridged tools")
+                self._bridged_tools_cache = []
+                return []
+
+            servers = servers_result.get("servers", [])
+            for server_info in servers:
+                if not isinstance(server_info, dict):
+                    continue
+
+                server_name = server_info.get("name")
+                if not isinstance(server_name, str) or not server_name.strip():
+                    continue
+
+                # Skip if server is not enabled
+                if not server_info.get("bridge_enabled") or not server_info.get("server_enabled"):
+                    continue
+
+                try:
+                    # Get tools for this server
+                    tools_result = await mcp_list_tools(self.app_resources, {"server": server_name})
+                    if tools_result.get("status") != "success":
+                        continue
+
+                    tools = tools_result.get("tools", [])
+                    for tool in tools:
+                        if not isinstance(tool, dict):
+                            continue
+
+                        tool_name = tool.get("name")
+                        if not isinstance(tool_name, str):
+                            continue
+
+                        # Create a namespaced tool name to avoid collisions
+                        namespaced_name = f"{server_name}__{tool_name}"
+
+                        # Extract schema and description
+                        input_schema = tool.get("inputSchema", {})
+                        description = tool.get("description", f"Bridged tool: {server_name}/{tool_name}")
+
+                        bridged_tools.append({
+                            "name": namespaced_name,
+                            "description": f"[{server_name}] {description}",
+                            "inputSchema": input_schema,
+                            "_bridge_server": server_name,
+                            "_bridge_tool": tool_name,
+                        })
+
+                except Exception as e:
+                    logger.warning(f"[MCP] Failed to load tools from server {server_name}: {e}")
+                    continue
+
+            self._bridged_tools_cache = bridged_tools
+            logger.info(f"[MCP] Loaded {len(bridged_tools)} bridged tools from {len(servers)} servers")
+
+        except Exception as e:
+            logger.warning(f"[MCP] Failed to load bridged tools: {e}")
+            self._bridged_tools_cache = []
+
+        return self._bridged_tools_cache
+
     async def process_request(self, connection: Any, request: Request) -> Response | None:
         """Return HTTP 426 for non-WebSocket requests (avoids noisy InvalidUpgrade logs)."""
         connection_header = request.headers.get("Connection", "")
@@ -305,10 +377,15 @@ class MCPServer:
 
         try:
             if method == "tools/list":
+                # Combine native tools with bridged tools
+                native_tools = list(self.tools.values())
+                bridged_tools = await self._load_bridged_tools()
+                all_tools = native_tools + bridged_tools
+
                 return {
                     "jsonrpc": "2.0",
                     "id": request_id,
-                    "result": {"tools": list(self.tools.values())},
+                    "result": {"tools": all_tools},
                 }
 
             if method == "tools/call":
@@ -350,6 +427,36 @@ class MCPServer:
         tool_name = params.get("name")
         arguments = params.get("arguments", {}) or {}
 
+        # Check if this is a bridged tool (namespaced with server__tool)
+        if "__" in str(tool_name):
+            bridged_tools = await self._load_bridged_tools()
+            for bridged_tool in bridged_tools:
+                if bridged_tool.get("name") == tool_name:
+                    # Extract server and tool names
+                    server = bridged_tool.get("_bridge_server")
+                    tool = bridged_tool.get("_bridge_tool")
+
+                    if server and tool:
+                        # Call the bridged tool via mcp_call
+                        try:
+                            result = await mcp_call(
+                                self.app_resources,
+                                {"server": server, "tool": tool, "arguments": arguments}
+                            )
+                            return {
+                                "jsonrpc": "2.0",
+                                "id": request_id,
+                                "result": {"content": [{"type": "text", "text": json.dumps(result, default=str)}]},
+                            }
+                        except MCPToolError as e:
+                            logger.warning(f"[MCP] Bridged tool error {server}/{tool}: {e.message}")
+                            return {
+                                "jsonrpc": "2.0",
+                                "id": request_id,
+                                "error": {"code": e.code, "message": e.message, "data": e.data},
+                            }
+
+        # Handle native tools
         if tool_name not in self.tools:
             return {
                 "jsonrpc": "2.0",
