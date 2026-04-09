@@ -1,7 +1,7 @@
 #!/bin/bash
 # Test abacus-proxy startup after removing tool injection code
 
-set -e
+set -euo pipefail
 
 echo "Testing abacus-proxy startup..."
 

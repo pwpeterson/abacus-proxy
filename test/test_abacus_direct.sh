@@ -1,7 +1,7 @@
 #!/bin/bash
 # Test abacus-proxy direct connection (without model-proxy)
 
-set -e
+set -euo pipefail
 
 echo "Testing abacus-proxy direct connection..."
 echo "================================================"

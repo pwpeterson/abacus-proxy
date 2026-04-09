@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 # Copy bridge_client.py from model-proxy
 cp /home/pwp/srv/apps/model-proxy/src/mcp/bridge_client.py src/mcp/bridge_client.py

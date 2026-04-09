@@ -1,7 +1,7 @@
 #!/bin/bash
 # Quick setup and test script for request tracking
 
-set -e
+set -euo pipefail
 
 echo "🚀 Setting up request tracking test environment"
 echo "================================================"

@@ -51,7 +51,7 @@ class MCPServer:
         self.connections: dict[str, Any] = {}
         self.app_resources = app_resources or {}
         self.tools = self._register_tools()
-        self._bridged_tools_cache: dict[str, list[dict[str, Any]]] | None = None
+        self._bridged_tools_cache: list[dict[str, Any]] | None = None
 
     def _register_tools(self) -> dict[str, Any]:
         """Register available MCP tools."""
@@ -443,10 +443,37 @@ class MCPServer:
                                 self.app_resources,
                                 {"server": server, "tool": tool, "arguments": arguments}
                             )
+                            
+                            # Extract the actual content from the mcp_call result
+                            # mcp_call returns a dict with status, content, result, etc.
+                            # We need to extract the actual tool result for MCP protocol
+                            if isinstance(result, dict):
+                                # If result has 'content' key (normalized MCP result), use it
+                                if "content" in result:
+                                    content_data = result["content"]
+                                    # If content is already in MCP format, use it directly
+                                    if isinstance(content_data, dict) and content_data.get("type") == "mcp_content":
+                                        mcp_content = content_data.get("content", [])
+                                    else:
+                                        # Otherwise wrap the content
+                                        mcp_content = [{"type": "text", "text": json.dumps(content_data, default=str)}]
+                                # If result has 'result' key (raw MCP tool result), extract content from it
+                                elif "result" in result:
+                                    raw_result = result["result"]
+                                    if isinstance(raw_result, dict) and "content" in raw_result:
+                                        mcp_content = raw_result["content"]
+                                    else:
+                                        mcp_content = [{"type": "text", "text": json.dumps(raw_result, default=str)}]
+                                else:
+                                    # Fallback: wrap entire result
+                                    mcp_content = [{"type": "text", "text": json.dumps(result, default=str)}]
+                            else:
+                                mcp_content = [{"type": "text", "text": json.dumps(result, default=str)}]
+                            
                             return {
                                 "jsonrpc": "2.0",
                                 "id": request_id,
-                                "result": {"content": [{"type": "text", "text": json.dumps(result, default=str)}]},
+                                "result": {"content": mcp_content},
                             }
                         except MCPToolError as e:
                             logger.warning(f"[MCP] Bridged tool error {server}/{tool}: {e.message}")

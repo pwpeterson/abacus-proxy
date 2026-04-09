@@ -232,7 +232,12 @@ def load_app_config() -> AppConfig:
         # Request Tracking (Supabase telemetry)
         enable_request_tracking=os.getenv("ENABLE_REQUEST_TRACKING", "false").lower() == "true",
         supabase_url=os.getenv("SUPABASE_URL") or None,
-        supabase_service_role_key=os.getenv("SUPABASE_SERVICE_ROLE_KEY") or None,
+        supabase_service_role_key=_get_first_env(
+            "SUPABASE_SERVICE_ROLE_KEY",
+            "SERVICE_ROLE_KEY",
+            "SUPABASE_SERVICE_KEY",
+            "SUPABASE_KEY",
+        ),
         store_request_payloads=os.getenv("STORE_REQUEST_PAYLOADS", "false").lower() == "true",
         store_response_payloads=os.getenv("STORE_RESPONSE_PAYLOADS", "false").lower() == "true",
         store_context_text=os.getenv("STORE_CONTEXT_TEXT", "false").lower() == "true",

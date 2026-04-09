@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 echo "Podman Containers - Port Mappings"
 echo "=========================================="

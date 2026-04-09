@@ -15,14 +15,18 @@ import os
 import sys
 from datetime import datetime
 
+import pytest
+
 # Configuration
 ABACUS_PROXY_URL = os.getenv("ABACUS_PROXY_URL", "http://localhost:8003")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "http://localhost:8100")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
 if not SUPABASE_SERVICE_KEY:
-    print("❌ Error: SUPABASE_SERVICE_KEY not found in environment")
-    sys.exit(1)
+    pytest.skip(
+        "SUPABASE_SERVICE_KEY not set; skipping request-tracking integration test",
+        allow_module_level=True,
+    )
 
 
 async def test_request_tracking():
@@ -79,6 +83,8 @@ async def test_request_tracking():
     print("\n🔍 Step 3: Querying Supabase for logged request...")
     
     try:
+        assert SUPABASE_SERVICE_KEY is not None
+
         async with httpx.AsyncClient(timeout=10.0) as client:
             # Query the abacus_proxy_requests table
             supabase_response = await client.get(
@@ -155,6 +161,8 @@ async def check_configuration():
     
     # Check Supabase connectivity
     try:
+        assert SUPABASE_SERVICE_KEY is not None
+
         async with httpx.AsyncClient(timeout=5.0) as client:
             supabase_response = await client.get(
                 f"{SUPABASE_URL}/rest/v1/",

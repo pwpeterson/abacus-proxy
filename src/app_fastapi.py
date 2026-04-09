@@ -306,6 +306,83 @@ def create_app(
 
         payload["messages"] = guarded
 
+        # Safety: prompt_guard may drop tool outputs while leaving tool calls (or vice versa),
+        # which makes upstream OpenAI-compatible validators reject the request.
+        # If we detect dangling tool history, remove the orphaned side.
+        def _sanitize_dangling_tool_history(msgs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            call_ids: set[str] = set()
+            output_ids: set[str] = set()
+
+            for m in msgs:
+                if not isinstance(m, dict):
+                    continue
+
+                tc = m.get("tool_calls")
+                if isinstance(tc, list):
+                    for item in tc:
+                        if isinstance(item, dict):
+                            tid = item.get("id")
+                            if isinstance(tid, str) and tid:
+                                call_ids.add(tid)
+
+                if m.get("role") == "tool":
+                    tid = m.get("tool_call_id")
+                    if isinstance(tid, str) and tid:
+                        output_ids.add(tid)
+
+            missing_outputs = call_ids - output_ids
+            missing_calls = output_ids - call_ids
+            if not missing_outputs and not missing_calls:
+                return msgs
+
+            sanitized: list[dict[str, Any]] = []
+            dropped_tool_msgs = 0
+            stripped_tool_calls = 0
+            dropped_empty_assistant = 0
+
+            for m in msgs:
+                if not isinstance(m, dict):
+                    continue
+
+                if m.get("role") == "tool":
+                    tid = m.get("tool_call_id")
+                    if isinstance(tid, str) and tid in missing_calls:
+                        dropped_tool_msgs += 1
+                        continue
+
+                tc = m.get("tool_calls")
+                if isinstance(tc, list) and tc:
+                    new_tc = [
+                        item
+                        for item in tc
+                        if isinstance(item, dict)
+                        and isinstance(item.get("id"), str)
+                        and item.get("id") not in missing_outputs
+                    ]
+                    if len(new_tc) != len(tc):
+                        stripped_tool_calls += (len(tc) - len(new_tc))
+                        m = dict(m)
+                        if new_tc:
+                            m["tool_calls"] = new_tc
+                        else:
+                            m.pop("tool_calls", None)
+                            content = m.get("content")
+                            if content is None or (isinstance(content, str) and not content.strip()):
+                                dropped_empty_assistant += 1
+                                continue
+
+                sanitized.append(m)
+
+            logger.warning(
+                "Prompt guard produced dangling tool history; sanitized "
+                f"missing_outputs={sorted(list(missing_outputs))[:5]} missing_calls={sorted(list(missing_calls))[:5]} "
+                f"dropped_tool_msgs={dropped_tool_msgs} stripped_tool_calls={stripped_tool_calls} "
+                f"dropped_empty_assistant={dropped_empty_assistant}"
+            )
+            return sanitized
+
+        payload["messages"] = _sanitize_dangling_tool_history(payload["messages"])
+
         if stats.dropped_messages or stats.truncated_messages:
             logger.info(
                 "Prompt guard applied "

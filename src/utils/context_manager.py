@@ -282,6 +282,98 @@ class ContextManager:
         else:
             return max(2, self.summary_limit)  # Tight budget
 
+    @staticmethod
+    def _extract_tool_call_ids(msg: dict[str, Any]) -> set[str]:
+        """Extract OpenAI-style tool call IDs from an assistant message."""
+        ids: set[str] = set()
+        tc = msg.get("tool_calls")
+        if not isinstance(tc, list):
+            return ids
+        for item in tc:
+            if not isinstance(item, dict):
+                continue
+            call_id = item.get("id")
+            if isinstance(call_id, str) and call_id:
+                ids.add(call_id)
+        return ids
+
+    @classmethod
+    def _ensure_tool_call_output_pairs(
+        cls,
+        messages: list[dict[str, Any]],
+        keep_positions: set[int],
+    ) -> set[int]:
+        """Ensure we never keep a tool call without its tool output (and vice versa).
+
+        OpenAI-compatible chat history must include a `role="tool"` message with
+        `tool_call_id=<id>` after any assistant message that includes a tool call
+        with id `<id>`. If we drop that tool output but keep the tool call, upstream
+        providers reject the request with e.g.:
+        "No tool output found for function call <id>".
+        """
+        call_positions_by_id: dict[str, set[int]] = {}
+        output_positions_by_id: dict[str, set[int]] = {}
+
+        for i, m in enumerate(messages):
+            if not isinstance(m, dict):
+                continue
+
+            # Assistant tool calls
+            for call_id in cls._extract_tool_call_ids(m):
+                call_positions_by_id.setdefault(call_id, set()).add(i)
+
+            # Tool outputs
+            if m.get("role") == "tool":
+                tool_call_id = m.get("tool_call_id")
+                if isinstance(tool_call_id, str) and tool_call_id:
+                    output_positions_by_id.setdefault(tool_call_id, set()).add(i)
+
+        all_ids = set(call_positions_by_id) | set(output_positions_by_id)
+        if not all_ids:
+            return keep_positions
+
+        # Expand until stable (handles multi-step expansion, though usually 1 pass).
+        changed = True
+        while changed:
+            changed = False
+            for tid in all_ids:
+                call_pos = call_positions_by_id.get(tid, set())
+                out_pos = output_positions_by_id.get(tid, set())
+
+                if (keep_positions & call_pos) and out_pos and not (keep_positions & out_pos):
+                    keep_positions |= out_pos
+                    changed = True
+
+                if (keep_positions & out_pos) and call_pos and not (keep_positions & call_pos):
+                    keep_positions |= call_pos
+                    changed = True
+
+        return keep_positions
+
+    @classmethod
+    def _audit_dangling_tool_calls(cls, messages: list[dict[str, Any]]) -> dict[str, Any]:
+        """Return info about dangling tool calls / outputs in a message list."""
+        call_ids: set[str] = set()
+        output_ids: set[str] = set()
+
+        for m in messages:
+            if not isinstance(m, dict):
+                continue
+            call_ids |= cls._extract_tool_call_ids(m)
+            if m.get("role") == "tool":
+                tool_call_id = m.get("tool_call_id")
+                if isinstance(tool_call_id, str) and tool_call_id:
+                    output_ids.add(tool_call_id)
+
+        missing_outputs = sorted(call_ids - output_ids)
+        missing_calls = sorted(output_ids - call_ids)
+        return {
+            "tool_calls": len(call_ids),
+            "tool_outputs": len(output_ids),
+            "missing_outputs": missing_outputs,
+            "missing_calls": missing_calls,
+        }
+
     def manage_context(
         self,
         *,
@@ -336,6 +428,8 @@ class ContextManager:
             "summary_added": False,
             "importance_scoring_enabled": self.enable_importance_scoring,
             "system_compression_enabled": self.enable_system_compression,
+            "tool_pairing_expansions": 0,
+            "dangling_tool_calls_detected": False,
         }
 
         if not enable_condensation or current_tokens <= threshold_tokens:
@@ -387,19 +481,25 @@ class ContextManager:
             if keep_non_system_count >= len(non_system_messages):
                 keep_non_system_count = max(1, len(non_system_messages) - 1)
             
-            # Keep top-scored messages
-            messages_to_keep = [msg for msg, score in scored_messages[:keep_non_system_count]]
-            messages_to_store = [msg for msg, score in scored_messages[keep_non_system_count:]]
-            
-            # Restore chronological order for kept messages
-            recent_non_system = sorted(
-                messages_to_keep,
-                key=lambda m: non_system_messages.index(m),
-            )
-            old_non_system = sorted(
-                messages_to_store,
-                key=lambda m: non_system_messages.index(m),
-            )
+            # Keep top-scored messages (by object identity).
+            index_by_obj_id = {id(m): idx for idx, m in enumerate(non_system_messages)}
+            keep_positions = {
+                index_by_obj_id[id(msg)]
+                for msg, _score in scored_messages[:keep_non_system_count]
+                if id(msg) in index_by_obj_id
+            }
+
+            before = len(keep_positions)
+            keep_positions = self._ensure_tool_call_output_pairs(non_system_messages, keep_positions)
+            after = len(keep_positions)
+            stats["tool_pairing_expansions"] = max(0, after - before)
+
+            recent_non_system = [
+                m for idx, m in enumerate(non_system_messages) if idx in keep_positions
+            ]
+            old_non_system = [
+                m for idx, m in enumerate(non_system_messages) if idx not in keep_positions
+            ]
         else:
             # Original tail-based retention
             keep_non_system_count = max(
@@ -503,6 +603,15 @@ class ContextManager:
             f"Context condensed: {current_tokens} → {new_tokens} tokens "
             f"(saved {stats['tokens_saved']} tokens, {stats['savings_percent']:.1f}% reduction)"
         )
+
+        audit = self._audit_dangling_tool_calls(condensed_messages)
+        if audit.get("missing_outputs") or audit.get("missing_calls"):
+            stats["dangling_tool_calls_detected"] = True
+            logger.warning(
+                "Condensed messages contain dangling tool history "
+                f"missing_outputs={audit.get('missing_outputs')} missing_calls={audit.get('missing_calls')}"
+            )
+
         return condensed_messages, stats
 
     def _get_context_summary(

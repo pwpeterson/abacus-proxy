@@ -1,7 +1,7 @@
 #!/bin/bash
 # Migrate abacus-proxy from container to host-based service
 
-set -e
+set -euo pipefail
 
 echo "🔄 Migrating abacus-proxy from container to host..."
 echo ""
