@@ -10,7 +10,6 @@ Network=host
 
 EnvironmentFile=/etc/containers/systemd/.env
 EnvironmentFile=/etc/containers/systemd/supabase.env
-EnvironmentFile=/etc/containers/systemd/model-proxy.env
 EnvironmentFile=/etc/containers/systemd/abacus-proxy.env
 
 Environment=ENABLE_PROMPT_LOGGING=true
