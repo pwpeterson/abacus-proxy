@@ -582,12 +582,27 @@ def create_app(
                     status_code=200,
                     content={
                         "object": "list",
-                        "data": [{"id": config.routellm_model_id, "object": "model"}],
+                        "data": [
+                            {"id": config.routellm_model_id, "object": "model"},
+                            {"id": config.vllm_model_id, "object": "model"}
+                        ],
                         "upstream_error": {"status_code": r.status_code, "body": data},
                     },
                 )
 
-            # Cache only successful results (raw upstream data).
+            # Add route-vllm to the model list before caching
+            if isinstance(data, dict):
+                models_list = data.get("data")
+                if isinstance(models_list, list):
+                    # Add route-vllm if not already present
+                    vllm_exists = any(
+                        isinstance(m, dict) and m.get("id") == config.vllm_model_id
+                        for m in models_list
+                    )
+                    if not vllm_exists:
+                        models_list.append({"id": config.vllm_model_id, "object": "model"})
+            
+            # Cache successful results
             cache["ts"] = now
             cache["data"] = data
             app.state.models_cache = cache
