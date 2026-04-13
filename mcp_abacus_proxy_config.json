@@ -90,7 +90,18 @@
     "args": [
       "-E",
       "ws://localhost:9002"
-    ]
+    ],
+    "alwaysAllow": [
+      "send_chat_request",
+      "stream_chat_request",
+      "list_available_models",
+      "get_model_proxy_url",
+      "mcp_list_servers",
+      "mcp_list_tools",
+      "mcp_call"
+    ],
+    "disabled": false,
+    "timeout": 30
   },
   "mcp-crawl4ai-rag": {
     "transport": "sse",

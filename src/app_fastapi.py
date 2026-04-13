@@ -676,9 +676,6 @@ def create_app(
 
         # Forward via the existing handler logic by calling upstream directly here
         # using the same routing/sanitization behaviors as chat_completions.
-        api_base = _normalize_api_base_url(config.routellm_api_base_url)
-        upstream_url = f"{api_base}/chat/completions"
-        _assert_not_recursive(upstream_url=upstream_url, request=request)
         headers = _get_upstream_headers(request=request)
 
         # Reuse the model routing/aliasing logic from chat_completions.
@@ -687,10 +684,22 @@ def create_app(
             requested_model = config.routellm_model_id
         requested_model = requested_model.strip()
 
-        aliases = getattr(config, "model_aliases", {}) or {}
-        upstream_model = aliases.get(requested_model, requested_model)
-        if upstream_model == "route-llm":
-            upstream_model = getattr(config, "route_default_target_model", "gpt-5.2") or "gpt-5.2"
+        # Determine which upstream API to use based on requested model
+        use_vllm = requested_model == config.vllm_model_id
+        if use_vllm:
+            api_base = _normalize_api_base_url(config.vllm_api_base_url)
+            upstream_model = requested_model
+        else:
+            api_base = _normalize_api_base_url(config.routellm_api_base_url)
+            
+            aliases = getattr(config, "model_aliases", {}) or {}
+            upstream_model = aliases.get(requested_model, requested_model)
+            if upstream_model == "route-llm":
+                upstream_model = getattr(config, "route_default_target_model", "gpt-5.2") or "gpt-5.2"
+
+        upstream_url = f"{api_base}/chat/completions"
+        _assert_not_recursive(upstream_url=upstream_url, request=request)
+        
         chat_payload["model"] = upstream_model
 
         stream = bool(chat_payload.get("stream", False))
@@ -911,11 +920,9 @@ def create_app(
 
         Important:
         - When model="route-llm", intelligent model selection is performed
+        - When model="route-vllm", requests are routed to local vLLM instance
         - Streaming is supported via pass-through when `stream=true`.
         """
-        api_base = _normalize_api_base_url(config.routellm_api_base_url)
-        upstream_url = f"{api_base}/chat/completions"
-        _assert_not_recursive(upstream_url=upstream_url, request=request)
         headers = _get_upstream_headers(request=request)
 
         try:
@@ -943,28 +950,43 @@ def create_app(
         # allow the client to request `route-llm` locally, while we forward to a
         # concrete upstream model (default: gpt-5.2).
         #
+        # route-vllm routes directly to local vLLM instance at configured URL.
+        #
         # This is controlled by:
         # - AppConfig.model_aliases (env: MODEL_ALIASES_JSON)
         # - AppConfig.route_default_target_model (env: ROUTE_DEFAULT_TARGET_MODEL)
+        # - AppConfig.vllm_api_base_url (env: VLLM_API_BASE_URL)
         # ------------------------------------------------------------------
         requested_model = payload.get("model")
         if not isinstance(requested_model, str) or not requested_model.strip():
             requested_model = config.routellm_model_id
         requested_model = requested_model.strip()
 
-        aliases = getattr(config, "model_aliases", {}) or {}
-        upstream_model = aliases.get(requested_model, requested_model)
+        # Determine which upstream API to use based on requested model
+        use_vllm = requested_model == config.vllm_model_id
+        if use_vllm:
+            api_base = _normalize_api_base_url(config.vllm_api_base_url)
+            upstream_model = requested_model
+        else:
+            api_base = _normalize_api_base_url(config.routellm_api_base_url)
+            
+            aliases = getattr(config, "model_aliases", {}) or {}
+            upstream_model = aliases.get(requested_model, requested_model)
 
-        # Intelligent model selection when route-llm is requested
-        if upstream_model == "route-llm":
-            if bool(getattr(config, "enable_intelligent_routing", True)):
-                upstream_model = await _select_best_model(payload, config=config)
-            else:
-                # Fallback to configured default
-                upstream_model = getattr(config, "route_default_target_model", "gpt-5.2") or "gpt-5.2"
+            # Intelligent model selection when route-llm is requested
+            if upstream_model == "route-llm":
+                if bool(getattr(config, "enable_intelligent_routing", True)):
+                    upstream_model = await _select_best_model(payload, config=config)
+                else:
+                    # Fallback to configured default
+                    upstream_model = getattr(config, "route_default_target_model", "gpt-5.2") or "gpt-5.2"
 
-        if upstream_model != requested_model:
-            logger.info(f"Model alias: requested={requested_model} -> upstream={upstream_model}")
+            if upstream_model != requested_model:
+                logger.info(f"Model alias: requested={requested_model} -> upstream={upstream_model}")
+
+        # Set upstream URL after determining API base
+        upstream_url = f"{api_base}/chat/completions"
+        _assert_not_recursive(upstream_url=upstream_url, request=request)
 
         # Overwrite model for upstream call. Everything else is passed through
         # (gpt-5.2 is standard OpenAI protocol per requirements).

@@ -69,6 +69,16 @@ class AppConfig(BaseModel):
     upstream_timeout_seconds: float = Field(default=120.0)
 
     # ---------------------------------------------------------------------
+    # Upstream vLLM (alternative routing target)
+    #
+    # For local vLLM deployments, this should be the full OpenAI-compatible
+    # API base (including /v1), e.g.:
+    #   http://localhost:8005/v1
+    # ---------------------------------------------------------------------
+    vllm_api_base_url: str = Field(default="http://localhost:8005/v1")
+    vllm_model_id: str = Field(default="route-vllm")
+
+    # ---------------------------------------------------------------------
     # Prompt/context-size guard (heuristic char budgets)
     #
     # Purpose: prevent upstream "input exceeds context window" failures by
