@@ -688,7 +688,8 @@ def create_app(
         use_vllm = requested_model == config.vllm_model_id
         if use_vllm:
             api_base = _normalize_api_base_url(config.vllm_api_base_url)
-            upstream_model = requested_model
+            # Translate route-vllm to actual vLLM model name
+            upstream_model = config.vllm_target_model
         else:
             api_base = _normalize_api_base_url(config.routellm_api_base_url)
             
@@ -966,7 +967,9 @@ def create_app(
         use_vllm = requested_model == config.vllm_model_id
         if use_vllm:
             api_base = _normalize_api_base_url(config.vllm_api_base_url)
-            upstream_model = requested_model
+            # Translate route-vllm to actual vLLM model name
+            upstream_model = config.vllm_target_model
+            logger.info(f"vLLM routing: requested={requested_model} -> upstream={upstream_model}")
         else:
             api_base = _normalize_api_base_url(config.routellm_api_base_url)
             

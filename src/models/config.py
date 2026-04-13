@@ -77,6 +77,7 @@ class AppConfig(BaseModel):
     # ---------------------------------------------------------------------
     vllm_api_base_url: str = Field(default="http://localhost:8005/v1")
     vllm_model_id: str = Field(default="route-vllm")
+    vllm_target_model: str = Field(default="gemma-4-26b-a4b-it", description="Actual model name to send to vLLM")
 
     # ---------------------------------------------------------------------
     # Prompt/context-size guard (heuristic char budgets)

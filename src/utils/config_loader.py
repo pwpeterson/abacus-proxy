@@ -164,6 +164,7 @@ def load_app_config() -> AppConfig:
         # Upstream vLLM (alternative routing target)
         vllm_api_base_url=os.getenv("VLLM_API_BASE_URL", "http://localhost:8005/v1"),
         vllm_model_id=os.getenv("VLLM_MODEL_ID", "route-vllm"),
+        vllm_target_model=os.getenv("VLLM_TARGET_MODEL", "gemma-4-26b-a4b-it"),
         # Prompt/context-size guard (heuristic char budgets)
         prompt_guard_enabled=os.getenv("PROMPT_GUARD_ENABLED", "true").lower() == "true",
         prompt_max_input_chars=int(os.getenv("PROMPT_MAX_INPUT_CHARS", "200000")),
