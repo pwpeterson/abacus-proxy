@@ -584,7 +584,20 @@ def create_app(
                         "object": "list",
                         "data": [
                             {"id": config.routellm_model_id, "object": "model"},
-                            {"id": config.vllm_model_id, "object": "model"}
+                            {
+                                "id": config.vllm_model_id,
+                                "name": config.vllm_model_id,
+                                "display_name": "RouteVLLM",
+                                "description": "RouteVLLM is a model that routes the user's message to currently active vllm model.",
+                                "model_type": "text_generation",
+                                "input_modalities": ["text", "image"],
+                                "output_modalities": ["text"],
+                                "input_token_rate": "0.000000",
+                                "output_token_rate": "0.000000",
+                                "context_length": 131000,
+                                "max_completion_tokens": 64000,
+                                "object": "model"
+                            }
                         ],
                         "upstream_error": {"status_code": r.status_code, "body": data},
                     },
@@ -600,7 +613,20 @@ def create_app(
                         for m in models_list
                     )
                     if not vllm_exists:
-                        models_list.append({"id": config.vllm_model_id, "object": "model"})
+                        models_list.append({
+                            "id": config.vllm_model_id,
+                            "name": config.vllm_model_id,
+                            "display_name": "RouteVLLM",
+                            "description": "RouteVLLM is a model that routes the user's message to currently active vllm model.",
+                            "model_type": "text_generation",
+                            "input_modalities": ["text", "image"],
+                            "output_modalities": ["text"],
+                            "input_token_rate": "0.000000",
+                            "output_token_rate": "0.000000",
+                            "context_length": 131000,
+                            "max_completion_tokens": 64000,
+                            "object": "model"
+                        })
             
             # Cache successful results
             cache["ts"] = now
