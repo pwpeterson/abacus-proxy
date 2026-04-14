@@ -32,6 +32,10 @@ from src.utils.request_logger import AbacusRequestLogger
 from src.utils.rules_prompt_injector import inject_retrieved_rules
 from src.utils.startup_indexer import auto_index_rules_on_startup
 from src.utils.performance_middleware import create_performance_middleware
+from src.utils.vllm_system_trimmer import trim_system_for_vllm
+from src.utils.tool_filter import filter_tools_array_for_vllm, filter_mcp_tools
+from src.utils.vllm_tool_parser import convert_vllm_response_to_openai
+from src.utils.intelligent_tool_selector import filter_tools_intelligently, filter_system_message_tools
 
 StartupHook = Callable[[dict[str, Any]], Awaitable[None]]
 ShutdownHook = Callable[[], Awaitable[None]]
@@ -81,6 +85,11 @@ def create_app(
                 enable_importance_scoring=bool(getattr(config, "enable_importance_scoring", True)),
                 enable_system_compression=bool(getattr(config, "enable_system_compression", True)),
                 enable_adaptive_summary=bool(getattr(config, "enable_adaptive_summary", True)),
+                enable_code_compression=bool(getattr(config, "enable_code_compression", True)),
+                enable_differential_compression=bool(getattr(config, "enable_differential_compression", True)),
+                enable_aggressive_system_dedup=bool(getattr(config, "enable_aggressive_system_dedup", True)),
+                code_compression_min_lines=int(getattr(config, "code_compression_min_lines", 20)),
+                differential_similarity_threshold=float(getattr(config, "differential_similarity_threshold", 0.85)),
             )
             app.state.memory_service = memory_service
             app.state.context_manager = context_manager
@@ -160,6 +169,7 @@ def create_app(
         return JSONResponse(
             status_code=200,
             content={
+                "status": "healthy",
                 "status": "healthy",
                 "service": "abacus-proxy",
                 "mcp_enabled": bool(config.enable_mcp),
@@ -287,8 +297,13 @@ def create_app(
         choice0["finish_reason"] = "tool_calls"
         return data
 
-    def _apply_prompt_guard(payload: dict[str, Any]) -> None:
-        """Trim chat message history to avoid upstream context-window failures."""
+    def _apply_prompt_guard(payload: dict[str, Any], max_context_length: int | None = None) -> None:
+        """Trim chat message history to avoid upstream context-window failures.
+        
+        Args:
+            payload: Request payload containing messages
+            max_context_length: Model's max context window in tokens (enables model-aware limits)
+        """
         if not getattr(config, "prompt_guard_enabled", True):
             return
 
@@ -302,6 +317,7 @@ def create_app(
             max_single_message_chars=int(getattr(config, "prompt_max_single_message_chars", 0) or 0),
             keep_last_messages=int(getattr(config, "prompt_keep_last_messages", 0) or 0),
             preserve_system_messages=bool(getattr(config, "prompt_preserve_system_messages", True)),
+            max_context_length=max_context_length,
         )
 
         payload["messages"] = guarded
@@ -435,6 +451,49 @@ def create_app(
 
         user_id, agent_id, project_id = _get_identity(request, payload)
 
+        # 0) INTELLIGENT TOOL SELECTION (BEFORE condensation)
+        if bool(getattr(config, "enable_intelligent_tool_selection", True)):
+            original_tools = payload.get("tools", [])
+            if original_tools:
+                filtered_tools, tool_stats = filter_tools_intelligently(
+                    all_tools=original_tools,
+                    messages=messages,
+                    memory_service=ms if getattr(config, "intelligent_tool_use_mem0", True) else None,
+                    user_id=user_id,
+                    project_id=project_id,
+                    core_tool_names=getattr(config, "core_tool_names", None),
+                )
+                
+                payload["tools"] = filtered_tools
+                
+                # Also filter system message to match selected tools
+                selected_tool_names = {
+                    tool.get("function", {}).get("name", "")
+                    for tool in filtered_tools
+                    if isinstance(tool, dict) and isinstance(tool.get("function"), dict)
+                }
+                
+                # Filter system message if present
+                if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+                    original_system_content = messages[0].get("content", "")
+                    if isinstance(original_system_content, str):
+                        filtered_system_content = filter_system_message_tools(
+                            original_system_content,
+                            selected_tool_names,
+                        )
+                        
+                        if filtered_system_content != original_system_content:
+                            # Create new message dict to avoid mutating original
+                            new_system_msg = dict(messages[0])
+                            new_system_msg["content"] = filtered_system_content
+                            messages = [new_system_msg] + messages[1:]
+                            payload["messages"] = messages
+                
+                logger.info(
+                    f"Intelligent tool selection: {tool_stats['total_tools']} → {tool_stats['selected_tools']} tools "
+                    f"(saved ~{(tool_stats['total_tools'] - tool_stats['selected_tools']) * 150} tokens)"
+                )
+
         # 1) Optional rules retrieval/injection
         if bool(getattr(config, "enable_rules_memory", False)):
             messages, rules_stats = await inject_retrieved_rules(
@@ -482,9 +541,8 @@ def create_app(
             session_id = request.headers.get("x-request-id") or f"req_{uuid.uuid4()}"
             max_ctx = int(getattr(config, "default_max_context_length", 65470) or 65470)
 
-            tools = payload.get("tools")
-            tools_for_estimation = tools if isinstance(tools, list) else None
-
+            # Include filtered tools in threshold (intelligent selection already reduced 235 → 7)
+            filtered_tools = payload.get("tools", [])
             messages, ctx_stats = cm.manage_context(
                 messages=messages,
                 model_id=model_id,
@@ -494,7 +552,7 @@ def create_app(
                 project_id=project_id,
                 session_id=str(session_id),
                 enable_condensation=True,
-                tools=tools_for_estimation,
+                tools=filtered_tools,  # Include filtered tools (7, not 235)
             )
             if ctx_stats.get("condensed"):
                 logger.info(
@@ -707,8 +765,9 @@ def create_app(
 
         await _apply_mem0_enhancements(chat_payload, request)
 
-        # Prompt guard last (after Mem0 enhancements).
-        _apply_prompt_guard(chat_payload)
+        # Prompt guard last (after Mem0 enhancements). Pass max context length.
+        max_ctx = int(getattr(config, "default_max_context_length", 65470) or 65470)
+        _apply_prompt_guard(chat_payload, max_context_length=max_ctx)
 
         # Pass-through a few commonly used sampling params.
         for k in ("max_tokens", "temperature", "top_p", "stop", "stream", "presence_penalty", "frequency_penalty"):
@@ -978,7 +1037,9 @@ def create_app(
         await _apply_mem0_enhancements(payload, request)
 
         # Prompt guard last (it may drop old messages; should run after condensation store).
-        _apply_prompt_guard(payload)
+        # Pass max context length for model-aware character limits.
+        max_ctx = int(getattr(config, "default_max_context_length", 65470) or 65470)
+        _apply_prompt_guard(payload, max_context_length=max_ctx)
 
         # Tool injection/filtering removed - Roo Code provides tools directly
         # Tools are passed through from client without modification
@@ -1011,6 +1072,34 @@ def create_app(
             # Translate route-vllm to actual vLLM model name
             upstream_model = config.vllm_target_model
             logger.info(f"vLLM routing: requested={requested_model} -> upstream={upstream_model}")
+            
+            # Apply vLLM system message trimming (aggressive compression)
+            messages = payload.get("messages", [])
+            if messages and isinstance(messages, list) and messages:
+                first_msg = messages[0]
+                if isinstance(first_msg, dict) and first_msg.get("role") == "system":
+                    original_content = first_msg.get("content", "")
+                    trimmed_content = trim_system_for_vllm(original_content)
+                    
+                    if trimmed_content != original_content:
+                        # Create new message dict to avoid mutating original
+                        new_first_msg = dict(first_msg)
+                        new_first_msg["content"] = trimmed_content
+                        
+                        # Replace in payload
+                        new_messages = [new_first_msg] + messages[1:]
+                        payload["messages"] = new_messages
+                        
+                        logger.info(
+                            f"[VLLM TRIM] System message trimmed for vLLM: "
+                            f"{len(str(original_content))} → {len(str(trimmed_content))} chars"
+                        )
+            
+            # Filter tools array for vLLM (keep only Roo Code built-in tools)
+            if payload.get("tools"):
+                original_tools = payload.get("tools", [])
+                filtered_tools = filter_tools_array_for_vllm(original_tools)
+                payload["tools"] = filtered_tools
         else:
             api_base = _normalize_api_base_url(config.routellm_api_base_url)
             
@@ -1027,6 +1116,39 @@ def create_app(
 
             if upstream_model != requested_model:
                 logger.info(f"Model alias: requested={requested_model} -> upstream={upstream_model}")
+            
+            # Apply MCP tool inclusion filtering for non-vLLM models (optional)
+            if bool(getattr(config, "enable_tool_inclusion", False)):
+                messages = payload.get("messages", [])
+                if messages and isinstance(messages, list) and messages:
+                    first_msg = messages[0]
+                    if isinstance(first_msg, dict) and first_msg.get("role") == "system":
+                        original_content = first_msg.get("content", "")
+                        
+                        # Determine filter method
+                        include_servers = getattr(config, "tool_include_servers", [])
+                        include_categories = getattr(config, "tool_include_categories", [])
+                        
+                        if include_servers or include_categories:
+                            filtered_content = filter_mcp_tools(
+                                original_content,
+                                categories=include_categories if include_categories else None,
+                                servers=include_servers if include_servers else None,
+                            )
+                            
+                            if filtered_content != original_content:
+                                # Create new message dict to avoid mutating original
+                                new_first_msg = dict(first_msg)
+                                new_first_msg["content"] = filtered_content
+                                
+                                # Replace in payload
+                                new_messages = [new_first_msg] + messages[1:]
+                                payload["messages"] = new_messages
+                                
+                                logger.info(
+                                    f"[TOOL INCLUSION] System message filtered for non-vLLM: "
+                                    f"{len(str(original_content))} → {len(str(filtered_content))} chars"
+                                )
 
         # Set upstream URL after determining API base
         upstream_url = f"{api_base}/chat/completions"
@@ -1058,6 +1180,7 @@ def create_app(
                     # Instead, fetch a normal (non-stream) completion and translate it into SSE chunks.
                     payload_nostream = dict(payload)
                     payload_nostream["stream"] = False
+                    payload_nostream.pop("stream_options", None)  # Remove to avoid vLLM validation error
 
                     r = await client.post(upstream_url, headers=headers, json=payload_nostream)
 
@@ -1075,6 +1198,10 @@ def create_app(
                     if r.status_code >= 400:
                         return JSONResponse(status_code=r.status_code, content=upstream_json)
 
+                    # Parse vLLM Hermes-format tool calls (only for vLLM responses)
+                    if use_vllm:
+                        upstream_json = convert_vllm_response_to_openai(upstream_json)
+                    
                     upstream_json = _rewrite_text_only_to_attempt_completion(upstream_json)
 
                     def _sse_line(obj: dict[str, Any] | str) -> bytes:
@@ -1135,74 +1262,54 @@ def create_app(
                                     "created": created,
                                     "model": model,
                                     "choices": [
-                                        {"index": idx, "delta": {"content": content}, "finish_reason": None}
+                                        {
+                                            "index": idx,
+                                            "delta": {"content": content},
+                                            "finish_reason": None,
+                                        }
                                     ],
                                 }
 
                             # Finish chunk
-                            yield {
-                                "id": comp_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model,
-                                "choices": [{"index": idx, "delta": {}, "finish_reason": finish_reason}],
-                            }
+                            if finish_reason:
+                                yield {
+                                    "id": comp_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model,
+                                    "choices": [{"index": idx, "delta": {}, "finish_reason": finish_reason}],
+                                }
 
-                    async def _iter_bytes():
-                        # Emit translated chunks then DONE.
-                        try:
-                            for ev in _completion_to_sse_events(upstream_json):
-                                yield _sse_line(ev)
-                        finally:
-                            yield _sse_line("[DONE]")
+                        yield "[DONE]"
+
+                    async def _stream_events():
+                        for chunk in _completion_to_sse_events(upstream_json):
+                            yield _sse_line(chunk)
 
                     return StreamingResponse(
-                        _iter_bytes(),
-                        status_code=200,
+                        _stream_events(),
                         media_type="text/event-stream",
                     )
 
+                # Non-streaming
                 r = await client.post(upstream_url, headers=headers, json=payload)
 
-            logger.info(
-                "Upstream /chat/completions responded "
-                f"status={r.status_code} elapsed_s={time.monotonic() - t0:.3f}"
-            )
-
-            # Best-effort JSON parse.
-            try:
-                data = r.json()
-                data = _rewrite_text_only_to_attempt_completion(data)
-                
-                # Log request (best-effort, never blocks)
-                try:
-                    request_logger_inst = getattr(app.state, "request_logger", None)
-                    if request_logger_inst and request_logger_inst.enabled:
-                        request_id = request.headers.get("x-request-id") or f"req_{uuid.uuid4()}"
-                        
-                        # Determine routing metadata
-                        routing_method = "intelligent" if upstream_model != requested_model and requested_model == "route-llm" else "direct"
-                        use_case = _detect_use_case(payload) if routing_method == "intelligent" else None
-                        
-                        request_logger_inst.log_request(
-                            request_id=request_id,
-                            request_payload=payload if config.store_request_payloads else {},
-                            response_payload=data if config.store_response_payloads else {},
-                            status_code=r.status_code,
-                            routing_method=routing_method,
-                            requested_model=requested_model,
-                            selected_model=upstream_model,
-                            use_case_detected=use_case,
-                        )
-                except Exception as log_err:
-                    logger.warning(f"Request tracking failed (ignored): {log_err}")
-                
-                return JSONResponse(status_code=r.status_code, content=data)
-            except Exception:
-                return JSONResponse(
-                    status_code=r.status_code,
-                    content={"raw_text": r.text},
+                logger.info(
+                    f"Upstream response: status={r.status_code} elapsed_s={time.monotonic() - t0:.3f}"
                 )
+
+                try:
+                    data = r.json()
+                except Exception:
+                    data = {"raw_text": r.text}
+
+                # Parse vLLM Hermes-format tool calls (only for vLLM responses)
+                if use_vllm and r.status_code < 400:
+                    data = convert_vllm_response_to_openai(data)
+
+                data = _rewrite_text_only_to_attempt_completion(data)
+
+                return JSONResponse(status_code=r.status_code, content=data)
 
         except httpx.ConnectError as e:
             raise HTTPException(status_code=502, detail="Failed to connect to upstream") from e

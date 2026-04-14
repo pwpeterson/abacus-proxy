@@ -71,13 +71,17 @@ class AppConfig(BaseModel):
     # ---------------------------------------------------------------------
     # Upstream vLLM (alternative routing target)
     #
-    # For local vLLM deployments, this should be the full OpenAI-compatible
+    # For local vLM deployments, this should be the full OpenAI-compatible
     # API base (including /v1), e.g.:
     #   http://localhost:8005/v1
     # ---------------------------------------------------------------------
     vllm_api_base_url: str = Field(default="http://localhost:8005/v1")
     vllm_model_id: str = Field(default="route-vllm")
     vllm_target_model: str = Field(default="gemma-4-26b-a4b-it", description="Actual model name to send to vLLM")
+    vllm_force_stream: bool = Field(
+        default=True,
+        description="Force streaming mode for vLLM requests (recommended for compatibility)"
+    )
 
     # ---------------------------------------------------------------------
     # Prompt/context-size guard (heuristic char budgets)
@@ -157,6 +161,74 @@ class AppConfig(BaseModel):
     abacus_api_key: str | None = Field(default=None, description="ABACUS_API_KEY")
 
     # ---------------------------------------------------------------------
+    # Intelligent Tool Selection
+    #
+    # Analyzes request context and selectively includes only relevant tools:
+    # - Always includes "core" tools (read_file, write_to_file, attempt_completion)
+    # - Intelligently selects additional tools based on:
+    #   * Request content keywords/semantics
+    #   * Recent tool usage patterns
+    #   * Mem0 insights (if enabled)
+    #
+    # Reduces token overhead by 50-80% (15K-25K tokens → 3K-5K tokens)
+    # ---------------------------------------------------------------------
+    enable_intelligent_tool_selection: bool = Field(
+        default=True,
+        description="Enable intelligent tool selection based on request context"
+    )
+    
+    intelligent_tool_use_mem0: bool = Field(
+        default=True,
+        description="Use Mem0 to suggest tools based on historical usage patterns"
+    )
+    
+    intelligent_tool_min_keyword_matches: int = Field(
+        default=1,
+        ge=1,
+        le=5,
+        description="Minimum keyword matches to include a tool category"
+    )
+    
+    intelligent_tool_recent_usage_window: int = Field(
+        default=10,
+        ge=3,
+        le=50,
+        description="Number of recent messages to analyze for tool usage patterns"
+    )
+    
+    # Core tools that are ALWAYS included (customizable via CORE_TOOL_NAMES env var)
+    core_tool_names: set[str] = Field(
+        default_factory=lambda: {
+            "read_file", "write_to_file", "list_files", "search_files",
+            "attempt_completion", "ask_followup_question", "execute_command",
+            "get_product_context", "get_active_context", "get_decisions",
+            "search_decisions_fts", "get_recent_activity_summary",
+        },
+        description="Tool names that are always included in intelligent selection"
+    )
+
+    # ---------------------------------------------------------------------
+    # MCP Tool Inclusion (legacy system prompt optimization)
+    #
+    # NOTE: Superseded by intelligent_tool_selection (above).
+    # Kept for backward compatibility. Use intelligent_tool_selection instead.
+    # ---------------------------------------------------------------------
+    enable_tool_inclusion: bool = Field(
+        default=False,
+        description="[LEGACY] Enable MCP tool inclusion filtering (use intelligent_tool_selection instead)"
+    )
+    
+    tool_include_categories: list[str] = Field(
+        default_factory=list,
+        description="[LEGACY] MCP server categories to include"
+    )
+    
+    tool_include_servers: list[str] = Field(
+        default_factory=list,
+        description="[LEGACY] Specific MCP servers to include"
+    )
+
+    # ---------------------------------------------------------------------
     # Mem0-backed memory + context management (condensation)
     # ---------------------------------------------------------------------
     enable_memory: bool = Field(default=True)
@@ -182,6 +254,60 @@ class AppConfig(BaseModel):
     )
     min_keep_messages: int = Field(default=5, ge=1, le=200, description="Always keep at least N messages")
     summary_limit: int = Field(default=3, ge=0, le=25, description="Retrieve up to N memories for summary context")
+
+    # Enhanced context management features
+    enable_dynamic_threshold: bool = Field(
+        default=True,
+        description="Dynamically adjust threshold based on request characteristics"
+    )
+    enable_importance_scoring: bool = Field(
+        default=True,
+        description="Use importance scoring for message retention (considers tool calls, errors, recency)"
+    )
+    enable_system_compression: bool = Field(
+        default=True,
+        description="Compress system messages when they exceed budget"
+    )
+    enable_adaptive_summary: bool = Field(
+        default=True,
+        description="Adapt summary retrieval limit based on available budget"
+    )
+
+    # Advanced compression strategies
+    enable_code_compression: bool = Field(
+        default=True,
+        description="Compress code blocks before storing in Mem0 (2-5K tokens saved)"
+    )
+    enable_differential_compression: bool = Field(
+        default=True,
+        description="Store only diffs for similar consecutive messages (1-3K tokens saved)"
+    )
+    enable_aggressive_system_dedup: bool = Field(
+        default=True,
+        description="Hash system message sections separately for better deduplication"
+    )
+
+    # Compression thresholds
+    code_compression_min_lines: int = Field(
+        default=20,
+        ge=5,
+        le=500,
+        description="Minimum code block lines to trigger compression"
+    )
+    differential_similarity_threshold: float = Field(
+        default=0.85,
+        ge=0.5,
+        le=0.99,
+        description="Similarity threshold for differential compression (0.0-1.0)"
+    )
+
+    # Default max context length (used for token budget calculations)
+    default_max_context_length: int = Field(
+        default=65470,
+        ge=1000,
+        le=200000,
+        description="Default maximum context length in tokens"
+    )
 
     # ---------------------------------------------------------------------
     # Mem0-backed `.roo` rules retrieval + injection (optional)

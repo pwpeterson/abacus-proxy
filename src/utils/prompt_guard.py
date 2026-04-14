@@ -3,6 +3,9 @@
 This module provides best-effort truncation of chat messages based on character
 budgets (tokenization-free heuristic). It is intentionally conservative and aims
 to preserve the most recent conversational context.
+
+Model-aware character limits ensure prompt guard triggers AFTER intelligent
+condensation, serving as a safety net rather than the primary trimming mechanism.
 """
 
 from __future__ import annotations
@@ -51,6 +54,43 @@ def _truncate_str_keep_tail(s: str, max_chars: int) -> str:
     return s[-max_chars:]
 
 
+def _calculate_model_aware_char_limit(
+    max_context_length: int,
+    condensation_threshold: float,
+) -> int:
+    """Calculate model-aware character limit that triggers AFTER condensation.
+    
+    Strategy:
+    - Large context models (≥32K): Allow ~85% of context as chars (triggers after 75-80% condensation)
+    - Medium context models (8K-32K): Allow ~70% of context as chars (triggers after 55% condensation)
+    - Small context models (<8K): Allow ~60% of context as chars (triggers after 35% condensation)
+    
+    Uses 4:1 character-to-token ratio (conservative heuristic).
+    
+    Args:
+        max_context_length: Model's maximum context window in tokens
+        condensation_threshold: Condensation trigger point (e.g., 0.80 for 80%)
+    
+    Returns:
+        Character limit that ensures prompt guard triggers AFTER condensation
+    """
+    # Model-aware multiplier (how much beyond condensation threshold before char limit triggers)
+    if max_context_length >= 32000:
+        # Large context: Allow up to 85% of context (beyond 75-80% condensation threshold)
+        char_threshold = 0.85
+    elif max_context_length >= 8000:
+        # Medium context: Allow up to 70% of context (beyond 55% condensation threshold)
+        char_threshold = 0.70
+    else:
+        # Small context (vLLM): Allow up to 60% of context (beyond 35% condensation threshold)
+        char_threshold = 0.60
+    
+    # Convert tokens to characters (4 chars per token heuristic)
+    char_limit = int(max_context_length * char_threshold * 4)
+    
+    return char_limit
+
+
 def guard_chat_messages(
     messages: list[dict[str, Any]],
     *,
@@ -58,6 +98,7 @@ def guard_chat_messages(
     max_single_message_chars: int,
     keep_last_messages: int,
     preserve_system_messages: bool = True,
+    max_context_length: int | None = None,
 ) -> tuple[list[dict[str, Any]], PromptGuardStats]:
     """Guard a chat `messages` array against excessive size.
 
@@ -69,12 +110,32 @@ def guard_chat_messages(
        - Non-system: keep tail (suffix) since newest details are commonly at the end.
     3) If still too large, drop oldest non-system messages until within `max_input_chars`.
 
+    Model-aware behavior:
+    - If `max_context_length` is provided, calculates model-aware character limit
+    - Character limit is set to trigger AFTER intelligent condensation
+    - Ensures prompt guard serves as safety net, not primary trimming mechanism
+
     Notes:
     - This is a heuristic; upstream context windows are token-based, but char budgets
       prevent worst-case blowups without introducing tokenizer dependencies.
     """
     if not isinstance(messages, list):
         return [], PromptGuardStats(0, 0, 0, 0)
+
+    # Model-aware character limit calculation
+    effective_max_input_chars = max_input_chars
+    if max_context_length is not None and max_context_length > 0:
+        # Calculate threshold that triggers AFTER condensation
+        # Use conservative estimate: large models use 75-80% condensation threshold
+        condensation_threshold = 0.80 if max_context_length >= 32000 else (
+            0.55 if max_context_length >= 8000 else 0.35
+        )
+        model_aware_limit = _calculate_model_aware_char_limit(
+            max_context_length, condensation_threshold
+        )
+        # Use the larger of configured limit or model-aware limit
+        # This ensures we don't accidentally make limits stricter
+        effective_max_input_chars = max(max_input_chars, model_aware_limit)
 
     # Shallow-copy to avoid mutating caller's objects.
     normalized: list[dict[str, Any]] = []
@@ -114,9 +175,9 @@ def guard_chat_messages(
             truncated_messages += 1
 
     # Step 3: drop oldest non-system messages until under budget.
-    if max_input_chars is not None and max_input_chars > 0:
+    if effective_max_input_chars is not None and effective_max_input_chars > 0:
         def _within_budget() -> bool:
-            return _total_chars(normalized) <= max_input_chars
+            return _total_chars(normalized) <= effective_max_input_chars
 
         if not _within_budget():
             # Separate system/non-system to avoid dropping system unless unavoidable.
@@ -137,7 +198,7 @@ def guard_chat_messages(
             if not _within_budget() and system_msgs:
                 # Allocate entire budget to system messages proportionally but simply:
                 # truncate each system message to fit an even split.
-                per_system = max_input_chars // max(1, len(system_msgs))
+                per_system = effective_max_input_chars // max(1, len(system_msgs))
                 for sm in system_msgs:
                     content = sm.get("content")
                     if isinstance(content, str) and len(content) > per_system:

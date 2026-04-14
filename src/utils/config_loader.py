@@ -98,6 +98,49 @@ def _parse_family_quality_priors(*, default: dict[str, float] | None = None) -> 
     return out or dict(default or {})
 
 
+def _parse_string_list(*, env_name: str, default: list[str] | None = None) -> list[str]:
+    """Parse a JSON array of strings from an environment variable.
+    
+    Example:
+      TOOL_INCLUDE_CATEGORIES='["core","memory","version_control"]'
+    """
+    raw = (os.getenv(env_name) or "").strip()
+    if not raw:
+        return list(default or [])
+    
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return list(default or [])
+    
+    if not isinstance(data, list):
+        return list(default or [])
+    
+    out: list[str] = []
+    for item in data:
+        if isinstance(item, str) and item.strip():
+            out.append(item.strip())
+    
+    return out
+
+
+def _parse_comma_separated_set(*, env_name: str, default: set[str] | None = None) -> set[str]:
+    """Parse a comma-separated string into a set of strings.
+    
+    Example:
+      CORE_TOOL_NAMES='read_file,write_to_file,list_files,search_files'
+    """
+    raw = (os.getenv(env_name) or "").strip()
+    if not raw:
+        return set(default or set())
+    
+    # Split by comma and strip whitespace
+    items = [item.strip() for item in raw.split(',')]
+    
+    # Filter out empty strings
+    return {item for item in items if item}
+
+
 def _parse_float(*, env_name: str, default: float) -> float:
     raw = (os.getenv(env_name) or "").strip()
     if not raw:
@@ -145,6 +188,22 @@ def load_app_config() -> AppConfig:
 
     # Legacy alias: some deployments used ENABLE_RAW_RESPONSE_LOGGING as a debug switch.
     legacy_raw_logging = os.getenv("ENABLE_RAW_RESPONSE_LOGGING", "").lower() == "true"
+
+    # MCP tool inclusion parsing
+    enable_tool_inclusion = os.getenv("ENABLE_TOOL_INCLUSION", "false").lower() == "true"
+    tool_include_categories = _parse_string_list(env_name="TOOL_INCLUDE_CATEGORIES", default=[])
+    tool_include_servers = _parse_string_list(env_name="TOOL_INCLUDE_SERVERS", default=[])
+
+    # Intelligent tool selection parsing
+    core_tool_names = _parse_comma_separated_set(
+        env_name="CORE_TOOL_NAMES",
+        default={
+            "read_file", "write_to_file", "list_files", "search_files",
+            "attempt_completion", "ask_followup_question", "execute_command",
+            "get_product_context", "get_active_context", "get_decisions",
+            "search_decisions_fts", "get_recent_activity_summary",
+        }
+    )
 
     return AppConfig(
         host=os.getenv("HOST", "0.0.0.0"),
@@ -215,7 +274,19 @@ def load_app_config() -> AppConfig:
         model_value_index_exclude_router_models=model_value_index_exclude_router_models,
         model_value_index_missing_thinking_penalty=model_value_index_missing_thinking_penalty,
         model_value_index_family_priors=model_value_index_family_priors,
+        # Intelligent routing
+        enable_intelligent_routing=os.getenv("ENABLE_INTELLIGENT_ROUTING", "true").lower() == "true",
         upstream_local_address=os.getenv("UPSTREAM_LOCAL_ADDRESS", "0.0.0.0"),
+        # Intelligent tool selection
+        enable_intelligent_tool_selection=os.getenv("ENABLE_INTELLIGENT_TOOL_SELECTION", "true").lower() == "true",
+        intelligent_tool_use_mem0=os.getenv("INTELLIGENT_TOOL_USE_MEM0", "true").lower() == "true",
+        intelligent_tool_min_keyword_matches=int(os.getenv("INTELLIGENT_TOOL_MIN_KEYWORD_MATCHES", "1")),
+        intelligent_tool_recent_usage_window=int(os.getenv("INTELLIGENT_TOOL_RECENT_USAGE_WINDOW", "10")),
+        core_tool_names=core_tool_names,
+        # MCP tool inclusion (system prompt optimization)
+        enable_tool_inclusion=enable_tool_inclusion,
+        tool_include_categories=tool_include_categories,
+        tool_include_servers=tool_include_servers,
         # Backward-compatible legacy fields
         routellm_base_url=os.getenv("ROUTELLM_BASE_URL", "https://routellm.abacus.ai"),
         abacus_api_key=_get_first_env(
