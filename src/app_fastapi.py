@@ -283,6 +283,7 @@ def create_app(
         if not isinstance(content, str) or not content.strip():
             return data
 
+        # Perform the rewrite
         msg["content"] = None
         msg["tool_calls"] = [
             {
@@ -295,6 +296,7 @@ def create_app(
             }
         ]
         choice0["finish_reason"] = "tool_calls"
+        
         return data
 
     def _apply_prompt_guard(payload: dict[str, Any], max_context_length: int | None = None) -> None:
@@ -1289,6 +1291,11 @@ def create_app(
                     return StreamingResponse(
                         _stream_events(),
                         media_type="text/event-stream",
+                        headers={
+                            "Cache-Control": "no-cache",
+                            "Connection": "keep-alive",
+                            "X-Accel-Buffering": "no",
+                        },
                     )
 
                 # Non-streaming
