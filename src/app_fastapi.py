@@ -1176,6 +1176,11 @@ def create_app(
                 original_tools = payload.get("tools", [])
                 filtered_tools = filter_tools_array_for_vllm(original_tools, core_tool_names=config.core_tool_names)
                 payload["tools"] = filtered_tools
+
+                logger.info(
+                    f"[VLLM TOOLS] Filtered tools for vLLM: {len(original_tools)} -> {len(filtered_tools)}; "
+                    f"core_allowlist_size={len(config.core_tool_names) if getattr(config, 'core_tool_names', None) else 0}"
+                )
         else:
             api_base = _normalize_api_base_url(config.routellm_api_base_url)
             

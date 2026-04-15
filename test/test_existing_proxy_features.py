@@ -259,6 +259,45 @@ async def test_chat_completions_stream_true_translates_to_sse(monkeypatch: pytes
 
 
 @pytest.mark.asyncio
+async def test_filter_tools_array_for_vllm_keeps_mcp_bridge_names() -> None:
+    from src.utils.tool_filter import filter_tools_array_for_vllm
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "mcp--conport--get_product_context",
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "attempt_completion",
+                "parameters": {"type": "object", "properties": {"result": {"type": "string"}}, "additionalProperties": False},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "mcp--filesystem--read_file",
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+            },
+        },
+    ]
+
+    filtered = filter_tools_array_for_vllm(
+        tools,
+        core_tool_names={"get_product_context", "attempt_completion", "read_file"},
+    )
+
+    kept_names = [t.get("function", {}).get("name") for t in filtered]
+    assert "mcp--conport--get_product_context" in kept_names
+    assert "attempt_completion" in kept_names
+    assert "mcp--filesystem--read_file" in kept_names
+
+
+@pytest.mark.asyncio
 async def test_models_endpoint_normalizes_base_url_and_caches(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[_Call] = []
 

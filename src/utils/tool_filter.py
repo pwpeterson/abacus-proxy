@@ -87,6 +87,33 @@ def filter_tools_array_for_vllm(
     
     # Use provided core_tool_names or fall back to BUILTIN_TOOLS
     allowed_tools = core_tool_names if core_tool_names else BUILTIN_TOOLS
+
+    def _is_allowed_tool_name(name: str) -> bool:
+        """Return True if `name` maps to a tool in allowed_tools.
+
+        vLLM may receive tool names in several formats depending on the client/runtime:
+        - plain: "get_product_context"
+        - bridged MCP (Roo Code): "mcp--conport--get_product_context"
+        - bridged MCP (alt): "mcp_conport_get_product_context"
+
+        CORE_TOOL_NAMES is configured using the *base* tool names (no prefixes).
+        """
+        if name in allowed_tools:
+            return True
+
+        # Common Roo MCP bridge format: mcp--server--tool
+        if name.startswith("mcp--") and "--" in name:
+            base = name.split("--")[-1]
+            if base in allowed_tools:
+                return True
+
+        # Common underscore format: mcp_server_tool
+        # We match by suffix to avoid guessing server names.
+        for core in allowed_tools:
+            if name.endswith(f"_{core}"):
+                return True
+
+        return False
     
     filtered_tools = []
     for tool in tools:
@@ -103,7 +130,7 @@ def filter_tools_array_for_vllm(
             continue
         
         # Keep only core tools
-        if name in allowed_tools:
+        if _is_allowed_tool_name(name):
             filtered_tools.append(tool)
     
     original_count = len(tools)
