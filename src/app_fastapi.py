@@ -367,6 +367,55 @@ def create_app(
         if changed:
             payload["tools"] = new_tools
 
+    def _normalize_tool_name_for_upstream(name: str) -> str:
+        """Normalize tool names for upstream models.
+
+        Goal: make abacus-proxy send tool names in the same style as direct OpenAI
+        usage where possible (base tool names like `get_active_context`).
+
+        If Roo provides MCP-bridge-prefixed names (e.g. `mcp--conport--get_active_context`),
+        upstream OpenAI-compatible models don't need the prefix and it can hurt tool selection.
+        """
+        if not isinstance(name, str):
+            return str(name)
+        if name.startswith("mcp--") and "--" in name:
+            return name.split("--")[-1]
+        return name
+
+    def _normalize_tools_names_for_upstream(payload: dict[str, Any]) -> None:
+        tools = payload.get("tools")
+        if not isinstance(tools, list) or not tools:
+            return
+
+        out: list[dict[str, Any]] = []
+        changed = False
+
+        for t in tools:
+            if not isinstance(t, dict):
+                continue
+            fn = t.get("function")
+            if not isinstance(fn, dict):
+                out.append(t)
+                continue
+            name = fn.get("name")
+            if not isinstance(name, str) or not name:
+                out.append(t)
+                continue
+
+            new_name = _normalize_tool_name_for_upstream(name)
+            if new_name != name:
+                changed = True
+                t2 = dict(t)
+                fn2 = dict(fn)
+                fn2["name"] = new_name
+                t2["function"] = fn2
+                out.append(t2)
+            else:
+                out.append(t)
+
+        if changed:
+            payload["tools"] = out
+
     def _apply_prompt_guard(payload: dict[str, Any], max_context_length: int | None = None) -> None:
         """Trim chat message history to avoid upstream context-window failures.
         
@@ -1111,6 +1160,10 @@ def create_app(
 
         # Ensure tool schemas are acceptable to strict OpenAI-compatible validators.
         _sanitize_tools_array_for_upstream(payload)
+
+        # Normalize tool names so upstream models see base tool names (no MCP bridge prefixes).
+        # Do this after sanitizing schemas, before any model routing.
+        _normalize_tools_names_for_upstream(payload)
 
         # Prompt guard last (it may drop old messages; should run after condensation store).
         # Pass max context length for model-aware character limits.

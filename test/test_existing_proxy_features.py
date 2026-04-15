@@ -298,6 +298,66 @@ async def test_filter_tools_array_for_vllm_keeps_mcp_bridge_names() -> None:
 
 
 @pytest.mark.asyncio
+async def test_chat_completions_normalizes_mcp_bridge_tool_names_for_upstream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[_Call] = []
+
+    def handler(method: str, url: str, _headers: Any, json_payload: dict[str, Any] | None) -> httpx.Response:
+        assert method == "POST"
+        assert url.endswith("/chat/completions")
+        assert json_payload is not None
+
+        # Tools should be normalized to base tool names (no mcp--server-- prefixes)
+        tools = json_payload.get("tools")
+        assert isinstance(tools, list)
+        tool_names = [t.get("function", {}).get("name") for t in tools]
+        assert "get_active_context" in tool_names
+        assert "mcp--conport--get_active_context" not in tool_names
+
+        upstream_json = {
+            "id": "chatcmpl-norm-tools",
+            "object": "chat.completion",
+            "created": 0,
+            "model": json_payload.get("model", "gpt-5.2"),
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+        return _make_httpx_response(method="POST", url=url, status_code=200, json_data=upstream_json)
+
+    FakeAsyncClient = _fake_async_client_factory(calls=calls, handler=handler)
+    monkeypatch.setattr(app_fastapi_mod.httpx, "AsyncClient", FakeAsyncClient)
+    _install_dummy_mem0(monkeypatch)
+
+    app = create_app(_base_config())
+    transport = RealASGITransport(app=app)
+    async with RealAsyncClient(transport=transport, base_url="http://test") as client:
+        payload = {
+            "model": "route-llm",
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "hi"},
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "mcp--conport--get_active_context",
+                        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+                    },
+                }
+            ],
+        }
+        r = await client.post("/v1/chat/completions", json=payload)
+        assert r.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_models_endpoint_normalizes_base_url_and_caches(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[_Call] = []
 

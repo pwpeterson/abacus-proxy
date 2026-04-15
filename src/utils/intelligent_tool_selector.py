@@ -237,12 +237,19 @@ class IntelligentToolSelector:
         # Direct match
         if tool_name in self.core_tool_names:
             return True
+
+        # Common Roo MCP bridge format: mcp--server--tool
+        # Example: mcp--conport--get_active_context
+        if tool_name.startswith("mcp--") and "--" in tool_name:
+            base = tool_name.split("--")[-1]
+            if base in self.core_tool_names:
+                return True
         
         # Strip MCP prefix and check (e.g., mcp_conport_get_decisions → get_decisions)
         for core_name in self.core_tool_names:
             if tool_name.endswith(f"_{core_name}") or tool_name == f"mcp_{core_name}":
                 return True
-        
+
         return False
 
     def _extract_user_request(self, messages: list[dict[str, Any]]) -> str:
