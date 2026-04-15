@@ -12,6 +12,7 @@ from loguru import logger
 
 
 # Roo Code built-in tools (always available, no external MCP servers)
+# Used as fallback when core_tool_names not provided
 BUILTIN_TOOLS = {
     "read_file",
     "read_text_file",
@@ -66,19 +67,26 @@ MCP_SERVER_CATEGORIES = {
 }
 
 
-def filter_tools_array_for_vllm(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Filter request payload tools array to built-in tools only.
+def filter_tools_array_for_vllm(
+    tools: list[dict[str, Any]],
+    core_tool_names: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Filter request payload tools array to core tools only.
     
-    vLLM should only receive Roo Code's built-in tools, no MCP tools.
+    vLLM should only receive core tools (configurable via CORE_TOOL_NAMES).
     
     Args:
         tools: Request payload tools array
+        core_tool_names: Set of core tool names to include (uses BUILTIN_TOOLS if None)
         
     Returns:
-        Filtered tools array with only built-in tools
+        Filtered tools array with only core tools
     """
     if not tools or not isinstance(tools, list):
         return tools
+    
+    # Use provided core_tool_names or fall back to BUILTIN_TOOLS
+    allowed_tools = core_tool_names if core_tool_names else BUILTIN_TOOLS
     
     filtered_tools = []
     for tool in tools:
@@ -94,8 +102,8 @@ def filter_tools_array_for_vllm(tools: list[dict[str, Any]]) -> list[dict[str, A
         if not isinstance(name, str):
             continue
         
-        # Keep only built-in tools (no MCP tools)
-        if name in BUILTIN_TOOLS:
+        # Keep only core tools
+        if name in allowed_tools:
             filtered_tools.append(tool)
     
     original_count = len(tools)
@@ -104,7 +112,7 @@ def filter_tools_array_for_vllm(tools: list[dict[str, Any]]) -> list[dict[str, A
     
     logger.info(
         f"[TOOL FILTER] vLLM tools array filtering: "
-        f"{original_count} → {filtered_count} tools ({reduction_pct:.1f}% reduction, built-in only)"
+        f"{original_count} → {filtered_count} tools ({reduction_pct:.1f}% reduction, core tools only)"
     )
     
     return filtered_tools

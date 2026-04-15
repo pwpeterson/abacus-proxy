@@ -107,6 +107,25 @@ class AppConfig(BaseModel):
         default=True, description="Preserve system messages when trimming history"
     )
 
+    # ---------------------------------------------------------------------
+    # Conversation completion contract (OpenAI-style tools)
+    #
+    # Purpose:
+    # - Encourage upstream models to call `attempt_completion` only when the
+    #   user's request is truly complete.
+    # - Avoid forcing task completion by proxy-side response rewriting.
+    # ---------------------------------------------------------------------
+    completion_contract_enabled: bool = Field(
+        default=True,
+        description=(
+            "Append a small instruction to the system prompt describing when to call "
+            "attempt_completion vs reply normally"
+        ),
+    )
+
+    # NOTE: We intentionally do NOT support proxy-side forced completion.
+    # Upstream models should call `attempt_completion` explicitly when done.
+
     # Default model alias target used when a client requests a "router" model
     # (e.g. route-llm) but we want deterministic round-trip testing against a
     # concrete model.

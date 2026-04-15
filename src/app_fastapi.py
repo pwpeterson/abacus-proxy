@@ -245,59 +245,127 @@ def create_app(
 
         return s.rstrip("/")
 
-    def _rewrite_text_only_to_attempt_completion(data: Any) -> Any:
-        """Rewrite text-only assistant replies into an OpenAI tool call.
+    def _apply_completion_contract(*, payload: dict[str, Any]) -> None:
+        """Append an instruction clarifying when to call `attempt_completion`.
 
-        If upstream returns an OpenAI-style chat completion with a text-only message:
-          choices[0].message.content = "<text>"
-          choices[0].message.tool_calls is missing/empty
-
-        then rewrite to:
-          choices[0].message.content = null
-          choices[0].message.tool_calls[0].function.name = "attempt_completion"
-          choices[0].message.tool_calls[0].function.arguments = "{\"result\": \"<text>\"}"
-          choices[0].finish_reason = "tool_calls"
-
-        If `tool_calls` already exist, do not modify the response.
+        This is a request-side behavior (system prompt shaping), not a response rewrite.
+        It helps upstream models distinguish between normal assistant replies and
+        explicit task completion.
         """
-        if not isinstance(data, dict):
-            return data
+        if not bool(getattr(config, "completion_contract_enabled", True)):
+            return
 
-        choices = data.get("choices")
-        if not isinstance(choices, list) or not choices:
-            return data
+        messages = payload.get("messages")
+        if not isinstance(messages, list) or not messages:
+            return
 
-        choice0 = choices[0]
-        if not isinstance(choice0, dict):
-            return data
+        # Find the first system message (avoid inventing one).
+        system_idx: int | None = None
+        for i, m in enumerate(messages[:5]):
+            if (
+                isinstance(m, dict)
+                and m.get("role") == "system"
+                and isinstance(m.get("content"), str)
+            ):
+                system_idx = i
+                break
 
-        msg = choice0.get("message")
-        if not isinstance(msg, dict):
-            return data
+        if system_idx is None:
+            return
 
-        tool_calls = msg.get("tool_calls")
-        if isinstance(tool_calls, list) and tool_calls:
-            return data
+        system_msg = messages[system_idx]
+        system_content = system_msg.get("content")
+        if not isinstance(system_content, str) or not system_content.strip():
+            return
 
-        content = msg.get("content")
-        if not isinstance(content, str) or not content.strip():
-            return data
+        # Idempotent: avoid appending repeatedly.
+        if "## Completion contract" in system_content:
+            return
 
-        # Perform the rewrite
-        msg["content"] = None
-        msg["tool_calls"] = [
-            {
-                "id": "call_attempt_completion_0",
-                "type": "function",
-                "function": {
-                    "name": "attempt_completion",
-                    "arguments": json.dumps({"result": content}, ensure_ascii=False),
-                },
-            }
-        ]
-        choice0["finish_reason"] = "tool_calls"
-        
-        return data
+        contract = (
+            "\n\n"
+            "## Completion contract\n"
+            "- Use normal assistant messages for continuing the conversation.\n"
+            "- Call the `attempt_completion` tool ONLY when the user's request is fully complete.\n"
+            "- Do NOT call `attempt_completion` for partial progress, intermediate updates, or follow-up questions.\n"
+        )
+
+        new_system = dict(system_msg)
+        new_system["content"] = system_content.rstrip() + contract
+
+        new_messages = list(messages)
+        new_messages[system_idx] = new_system
+        payload["messages"] = new_messages
+
+    def _sanitize_openai_tool_schema(schema: Any) -> Any:
+        """Best-effort sanitize OpenAI tool schemas for strict validators.
+
+        - Remove unsupported/overly-strict keys like `propertyNames`.
+        - Ensure object schemas have `additionalProperties: false`.
+
+        This is intentionally conservative and does not attempt full JSON Schema validation.
+        """
+        if isinstance(schema, list):
+            return [_sanitize_openai_tool_schema(x) for x in schema]
+        if not isinstance(schema, dict):
+            return schema
+
+        out = dict(schema)
+        out.pop("propertyNames", None)
+
+        for k in ("anyOf", "oneOf", "allOf"):
+            if isinstance(out.get(k), list):
+                out[k] = [_sanitize_openai_tool_schema(x) for x in out[k]]
+
+        if isinstance(out.get("properties"), dict):
+            out["properties"] = {kk: _sanitize_openai_tool_schema(vv) for kk, vv in out["properties"].items()}
+
+        if "items" in out:
+            out["items"] = _sanitize_openai_tool_schema(out["items"])
+
+        for defs_key in ("$defs", "definitions"):
+            if isinstance(out.get(defs_key), dict):
+                out[defs_key] = {kk: _sanitize_openai_tool_schema(vv) for kk, vv in out[defs_key].items()}
+
+        # Enforce strict object schemas.
+        if out.get("type") == "object":
+            out["additionalProperties"] = False
+
+        return out
+
+    def _sanitize_tools_array_for_upstream(payload: dict[str, Any]) -> None:
+        tools = payload.get("tools")
+        if not isinstance(tools, list) or not tools:
+            return
+
+        new_tools: list[dict[str, Any]] = []
+        changed = False
+
+        for t in tools:
+            if not isinstance(t, dict):
+                continue
+            fn = t.get("function")
+            if not isinstance(fn, dict):
+                new_tools.append(t)
+                continue
+            params = fn.get("parameters")
+            if not isinstance(params, dict):
+                new_tools.append(t)
+                continue
+
+            sanitized = _sanitize_openai_tool_schema(params)
+            if sanitized is not params:
+                changed = True
+                t2 = dict(t)
+                fn2 = dict(fn)
+                fn2["parameters"] = sanitized
+                t2["function"] = fn2
+                new_tools.append(t2)
+            else:
+                new_tools.append(t)
+
+        if changed:
+            payload["tools"] = new_tools
 
     def _apply_prompt_guard(payload: dict[str, Any], max_context_length: int | None = None) -> None:
         """Trim chat message history to avoid upstream context-window failures.
@@ -1038,6 +1106,12 @@ def create_app(
 
         await _apply_mem0_enhancements(payload, request)
 
+        # Encourage upstream to call attempt_completion only when truly done.
+        _apply_completion_contract(payload=payload)
+
+        # Ensure tool schemas are acceptable to strict OpenAI-compatible validators.
+        _sanitize_tools_array_for_upstream(payload)
+
         # Prompt guard last (it may drop old messages; should run after condensation store).
         # Pass max context length for model-aware character limits.
         max_ctx = int(getattr(config, "default_max_context_length", 65470) or 65470)
@@ -1097,10 +1171,10 @@ def create_app(
                             f"{len(str(original_content))} → {len(str(trimmed_content))} chars"
                         )
             
-            # Filter tools array for vLLM (keep only Roo Code built-in tools)
+            # Filter tools array for vLLM (use CORE_TOOL_NAMES from config)
             if payload.get("tools"):
                 original_tools = payload.get("tools", [])
-                filtered_tools = filter_tools_array_for_vllm(original_tools)
+                filtered_tools = filter_tools_array_for_vllm(original_tools, core_tool_names=config.core_tool_names)
                 payload["tools"] = filtered_tools
         else:
             api_base = _normalize_api_base_url(config.routellm_api_base_url)
@@ -1204,8 +1278,6 @@ def create_app(
                     if use_vllm:
                         upstream_json = convert_vllm_response_to_openai(upstream_json)
                     
-                    upstream_json = _rewrite_text_only_to_attempt_completion(upstream_json)
-
                     def _sse_line(obj: dict[str, Any] | str) -> bytes:
                         import json as _json
 
@@ -1313,8 +1385,6 @@ def create_app(
                 # Parse vLLM Hermes-format tool calls (only for vLLM responses)
                 if use_vllm and r.status_code < 400:
                     data = convert_vllm_response_to_openai(data)
-
-                data = _rewrite_text_only_to_attempt_completion(data)
 
                 return JSONResponse(status_code=r.status_code, content=data)
 

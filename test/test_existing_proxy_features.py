@@ -133,7 +133,13 @@ async def test_chat_completions_model_alias_and_tool_schema_sanitization(monkeyp
     async with RealAsyncClient(transport=transport, base_url="http://test") as client:
         payload = {
             "model": "route-llm",
-            "messages": [{"role": "user", "content": "hi"}],
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant.\n\nMCP SERVERS\n\n(placeholder)\n\n====",
+                },
+                {"role": "user", "content": "hi"},
+            ],
             "tools": [
                 {
                     "type": "function",
@@ -158,12 +164,19 @@ async def test_chat_completions_model_alias_and_tool_schema_sanitization(monkeyp
 
 @pytest.mark.asyncio
 async def test_chat_completions_rewrites_text_only_to_attempt_completion(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Legacy proxy-side forced attempt_completion rewrite was removed.
+    # Keep this test as a no-op placeholder so historical behavior is documented.
+    pytest.skip("proxy-side text-only->attempt_completion rewrite was removed")
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_does_not_rewrite_text_only_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[_Call] = []
 
     def handler(method: str, url: str, _headers: Any, json_payload: dict[str, Any] | None) -> httpx.Response:
         assert method == "POST"
         upstream_json = {
-            "id": "chatcmpl-2",
+            "id": "chatcmpl-2b",
             "object": "chat.completion",
             "created": 0,
             "model": (json_payload or {}).get("model", "gpt-5.2"),
@@ -181,19 +194,26 @@ async def test_chat_completions_rewrites_text_only_to_attempt_completion(monkeyp
     monkeypatch.setattr(app_fastapi_mod.httpx, "AsyncClient", FakeAsyncClient)
     _install_dummy_mem0(monkeypatch)
 
+    # Default: proxy does not force attempt_completion rewrite
     app = create_app(_base_config())
     transport = RealASGITransport(app=app)
     async with RealAsyncClient(transport=transport, base_url="http://test") as client:
         r = await client.post(
             "/v1/chat/completions",
-            json={"model": "gpt-5.2", "messages": [{"role": "user", "content": "hello"}]},
+            json={
+                "model": "gpt-5.2",
+                "messages": [
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": "hello"},
+                ],
+            },
         )
         data = r.json()
 
     msg = data["choices"][0]["message"]
-    assert msg["content"] is None
-    assert msg["tool_calls"][0]["function"]["name"] == "attempt_completion"
-    assert data["choices"][0]["finish_reason"] == "tool_calls"
+    assert msg.get("content") == "plain text reply"
+    assert not msg.get("tool_calls")
+    assert data["choices"][0]["finish_reason"] == "stop"
 
 
 @pytest.mark.asyncio

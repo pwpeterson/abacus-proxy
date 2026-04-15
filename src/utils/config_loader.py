@@ -194,6 +194,9 @@ def load_app_config() -> AppConfig:
     tool_include_categories = _parse_string_list(env_name="TOOL_INCLUDE_CATEGORIES", default=[])
     tool_include_servers = _parse_string_list(env_name="TOOL_INCLUDE_SERVERS", default=[])
 
+    # Completion contract
+    completion_contract_enabled = os.getenv("COMPLETION_CONTRACT_ENABLED", "true").lower() == "true"
+
     # Intelligent tool selection parsing
     core_tool_names = _parse_comma_separated_set(
         env_name="CORE_TOOL_NAMES",
@@ -287,6 +290,9 @@ def load_app_config() -> AppConfig:
         enable_tool_inclusion=enable_tool_inclusion,
         tool_include_categories=tool_include_categories,
         tool_include_servers=tool_include_servers,
+
+        # Completion contract
+        completion_contract_enabled=completion_contract_enabled,
         # Backward-compatible legacy fields
         routellm_base_url=os.getenv("ROUTELLM_BASE_URL", "https://routellm.abacus.ai"),
         abacus_api_key=_get_first_env(
