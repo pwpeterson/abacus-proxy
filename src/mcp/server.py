@@ -342,6 +342,8 @@ class MCPServer:
 
             if "method" in data:
                 response = await self._handle_method_call(data, connection_id)
+                if response is None:
+                    return
             else:
                 response = {
                     "jsonrpc": "2.0",
@@ -403,9 +405,10 @@ class MCPServer:
                 }
 
             if method == "notifications/initialized":
-                # Notification; respond with an empty result if client sent an id (rare).
-                if request_id is None:
-                    return {"jsonrpc": "2.0", "id": request_id, "result": {}}
+                # Notifications should not return a response according to JSON-RPC 2.0.
+                # However, if we must return something for compliance with certain clients,
+                # we still shouldn't return 'null' for the ID if we have one.
+                return None
 
             return {
                 "jsonrpc": "2.0",

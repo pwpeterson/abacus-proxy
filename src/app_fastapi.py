@@ -10,9 +10,11 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any
 
 import asyncio
+import copy
 import json
 import time
 import uuid
@@ -32,8 +34,11 @@ from src.utils.request_logger import AbacusRequestLogger
 from src.utils.rules_prompt_injector import inject_retrieved_rules
 from src.utils.startup_indexer import auto_index_rules_on_startup
 from src.utils.performance_middleware import create_performance_middleware
-from src.utils.vllm_system_trimmer import trim_system_for_vllm
-from src.utils.tool_filter import filter_tools_array_for_vllm, filter_mcp_tools
+from src.utils.vllm_system_trimmer import (
+    inject_vllm_tool_calling_strictness_into_messages,
+    trim_system_for_vllm,
+)
+from src.utils.tool_filter import filter_mcp_tools
 from src.utils.vllm_tool_parser import convert_vllm_response_to_openai
 from src.utils.intelligent_tool_selector import filter_tools_intelligently, filter_system_message_tools
 
@@ -302,6 +307,7 @@ def create_app(
 
         - Remove unsupported/overly-strict keys like `propertyNames`.
         - Ensure object schemas have `additionalProperties: false`.
+        - Convert Draft 6+ `exclusiveMinimum`/`exclusiveMaximum` to Draft 4.
 
         This is intentionally conservative and does not attempt full JSON Schema validation.
         """
@@ -310,25 +316,23 @@ def create_app(
         if not isinstance(schema, dict):
             return schema
 
-        out = dict(schema)
-        out.pop("propertyNames", None)
+        out = {}
+        for k, v in schema.items():
+            # Draft 6+: exclusiveMinimum is a number
+            # Draft 4: minimum is the number, exclusiveMinimum is a boolean
+            if k == "exclusiveMinimum" and isinstance(v, (int, float)):
+                out["minimum"] = v
+                out["exclusiveMinimum"] = True
+            elif k == "exclusiveMaximum" and isinstance(v, (int, float)):
+                out["maximum"] = v
+                out["exclusiveMaximum"] = True
+            elif k == "propertyNames":
+                continue
+            else:
+                out[k] = _sanitize_openai_tool_schema(v)
 
-        for k in ("anyOf", "oneOf", "allOf"):
-            if isinstance(out.get(k), list):
-                out[k] = [_sanitize_openai_tool_schema(x) for x in out[k]]
-
-        if isinstance(out.get("properties"), dict):
-            out["properties"] = {kk: _sanitize_openai_tool_schema(vv) for kk, vv in out["properties"].items()}
-
-        if "items" in out:
-            out["items"] = _sanitize_openai_tool_schema(out["items"])
-
-        for defs_key in ("$defs", "definitions"):
-            if isinstance(out.get(defs_key), dict):
-                out[defs_key] = {kk: _sanitize_openai_tool_schema(vv) for kk, vv in out[defs_key].items()}
-
-        # Enforce strict object schemas.
-        if out.get("type") == "object":
+        # Enforce strict object schemas if not already set.
+        if out.get("type") == "object" and "additionalProperties" not in out:
             out["additionalProperties"] = False
 
         return out
@@ -367,54 +371,6 @@ def create_app(
         if changed:
             payload["tools"] = new_tools
 
-    def _normalize_tool_name_for_upstream(name: str) -> str:
-        """Normalize tool names for upstream models.
-
-        Goal: make abacus-proxy send tool names in the same style as direct OpenAI
-        usage where possible (base tool names like `get_active_context`).
-
-        If Roo provides MCP-bridge-prefixed names (e.g. `mcp--conport--get_active_context`),
-        upstream OpenAI-compatible models don't need the prefix and it can hurt tool selection.
-        """
-        if not isinstance(name, str):
-            return str(name)
-        if name.startswith("mcp--") and "--" in name:
-            return name.split("--")[-1]
-        return name
-
-    def _normalize_tools_names_for_upstream(payload: dict[str, Any]) -> None:
-        tools = payload.get("tools")
-        if not isinstance(tools, list) or not tools:
-            return
-
-        out: list[dict[str, Any]] = []
-        changed = False
-
-        for t in tools:
-            if not isinstance(t, dict):
-                continue
-            fn = t.get("function")
-            if not isinstance(fn, dict):
-                out.append(t)
-                continue
-            name = fn.get("name")
-            if not isinstance(name, str) or not name:
-                out.append(t)
-                continue
-
-            new_name = _normalize_tool_name_for_upstream(name)
-            if new_name != name:
-                changed = True
-                t2 = dict(t)
-                fn2 = dict(fn)
-                fn2["name"] = new_name
-                t2["function"] = fn2
-                out.append(t2)
-            else:
-                out.append(t)
-
-        if changed:
-            payload["tools"] = out
 
     def _apply_prompt_guard(payload: dict[str, Any], max_context_length: int | None = None) -> None:
         """Trim chat message history to avoid upstream context-window failures.
@@ -571,7 +527,10 @@ def create_app(
         user_id, agent_id, project_id = _get_identity(request, payload)
 
         # 0) INTELLIGENT TOOL SELECTION (BEFORE condensation)
-        if bool(getattr(config, "enable_intelligent_tool_selection", True)):
+        # NOTE: When tool_payload_passthrough is enabled, we skip all tool filtering.
+        if not bool(getattr(config, "tool_payload_passthrough", False)) and bool(
+            getattr(config, "enable_intelligent_tool_selection", True)
+        ):
             original_tools = payload.get("tools", [])
             if original_tools:
                 filtered_tools, tool_stats = filter_tools_intelligently(
@@ -580,7 +539,7 @@ def create_app(
                     memory_service=ms if getattr(config, "intelligent_tool_use_mem0", True) else None,
                     user_id=user_id,
                     project_id=project_id,
-                    core_tool_names=getattr(config, "core_tool_names", None),
+                    core_tools_to_include=getattr(config, "core_tools_to_include", None),
                 )
                 
                 payload["tools"] = filtered_tools
@@ -1145,6 +1104,9 @@ def create_app(
         """
         headers = _get_upstream_headers(request=request)
 
+        request_id = request.headers.get("x-request-id") or f"req_{uuid.uuid4()}"
+        req_ts = time.time()
+
         try:
             payload = await request.json()
         except Exception as e:
@@ -1153,17 +1115,25 @@ def create_app(
         if not isinstance(payload, dict):
             raise HTTPException(status_code=400, detail="Request body must be a JSON object")
 
+        # Snapshot the raw Roo Code request payload *before* any proxy-side mutations
+        # (Mem0 enhancements, tool filtering, prompt guard, vLLM trimming, model aliasing, etc.).
+        raw_payload_snapshot: dict[str, Any] = copy.deepcopy(payload)
+
         await _apply_mem0_enhancements(payload, request)
 
         # Encourage upstream to call attempt_completion only when truly done.
         _apply_completion_contract(payload=payload)
 
-        # Ensure tool schemas are acceptable to strict OpenAI-compatible validators.
-        _sanitize_tools_array_for_upstream(payload)
-
-        # Normalize tool names so upstream models see base tool names (no MCP bridge prefixes).
-        # Do this after sanitizing schemas, before any model routing.
-        _normalize_tools_names_for_upstream(payload)
+        # Tool debugging mode: forward tools exactly as received from Roo.
+        # This disables any proxy-side tool filtering/renaming/sanitization.
+        tool_passthrough = bool(getattr(config, "tool_payload_passthrough", False))
+        if tool_passthrough:
+            logger.warning(
+                "[TOOLS] TOOL_PAYLOAD_PASSTHROUGH enabled: forwarding `tools` exactly as provided by client"
+            )
+        else:
+            # Ensure tool schemas are acceptable to strict OpenAI-compatible validators.
+            _sanitize_tools_array_for_upstream(payload)
 
         # Prompt guard last (it may drop old messages; should run after condensation store).
         # Pass max context length for model-aware character limits.
@@ -1201,7 +1171,26 @@ def create_app(
             # Translate route-vllm to actual vLLM model name
             upstream_model = config.vllm_target_model
             logger.info(f"vLLM routing: requested={requested_model} -> upstream={upstream_model}")
-            
+
+            # ------------------------------------------------------------------
+            # vLLM tool-calling strictness
+            #
+            # Some vLLM-served models (e.g. Gemma) tend to hallucinate a generic
+            # dispatcher tool like `mcp(...)` and embed the real tool call in a
+            # string. Roo expects exact tool names.
+            #
+            # We inject a small system instruction listing the exact core tools
+            # present in the Roo request's `tools` array.
+            # ------------------------------------------------------------------
+            try:
+                payload["messages"] = inject_vllm_tool_calling_strictness_into_messages(
+                    payload.get("messages", []),
+                    tools=payload.get("tools") if isinstance(payload.get("tools"), list) else None,
+                    core_tool_names=set(getattr(config, "core_tools_to_include", set()) or set()),
+                )
+            except Exception as e:
+                logger.debug(f"[VLLM STRICTNESS] Injection skipped (ignored): {e}")
+             
             # Apply vLLM system message trimming (aggressive compression)
             messages = payload.get("messages", [])
             if messages and isinstance(messages, list) and messages:
@@ -1224,16 +1213,9 @@ def create_app(
                             f"{len(str(original_content))} → {len(str(trimmed_content))} chars"
                         )
             
-            # Filter tools array for vLLM (use CORE_TOOL_NAMES from config)
-            if payload.get("tools"):
-                original_tools = payload.get("tools", [])
-                filtered_tools = filter_tools_array_for_vllm(original_tools, core_tool_names=config.core_tool_names)
-                payload["tools"] = filtered_tools
-
-                logger.info(
-                    f"[VLLM TOOLS] Filtered tools for vLLM: {len(original_tools)} -> {len(filtered_tools)}; "
-                    f"core_allowlist_size={len(config.core_tool_names) if getattr(config, 'core_tool_names', None) else 0}"
-                )
+            # Tool filtering for vLLM is handled by the same intelligent tool selection
+            # path as non-vLLM (core allowlist + context-selected tools), inside
+            # `_apply_mem0_enhancements()`.
         else:
             api_base = _normalize_api_base_url(config.routellm_api_base_url)
             
@@ -1297,6 +1279,65 @@ def create_app(
             # Hint SSE for OpenAI-compatible streaming.
             headers.setdefault("Accept", "text/event-stream")
 
+        def _maybe_store_payload(value: dict[str, Any] | None, *, store: bool) -> dict[str, Any] | None:
+            if not store:
+                return None
+            return value
+
+        def _log_request_tracking(
+            *,
+            response_payload: dict[str, Any] | None,
+            status_code: int,
+            condensed_payload: dict[str, Any] | None = None,
+            error: str | None = None,
+        ) -> None:
+            rl = getattr(app.state, "request_logger", None)
+            if rl is None:
+                return
+
+            try:
+                req_dt = datetime.fromtimestamp(req_ts, tz=timezone.utc)
+                resp_dt = datetime.now(timezone.utc)
+                duration_ms = int((time.time() - req_ts) * 1000)
+
+                # Respect privacy toggles.
+                store_req = bool(getattr(config, "store_request_payloads", False))
+                store_resp = bool(getattr(config, "store_response_payloads", False))
+
+                # request_roo_code: raw request received from Roo Code (pre-processing)
+                req_payload_to_store = _maybe_store_payload(raw_payload_snapshot, store=store_req) or {
+                    "model": raw_payload_snapshot.get("model")
+                }
+
+                # request_condensed: post condensed/filtered/processed request as sent upstream
+                condensed_base: dict[str, Any] = condensed_payload if isinstance(condensed_payload, dict) else payload
+                req_condensed_to_store = _maybe_store_payload(condensed_base, store=store_req) or {
+                    "model": condensed_base.get("model")
+                }
+                resp_payload_to_store = _maybe_store_payload(response_payload, store=store_resp)
+
+                # Note: requested_model is the incoming model id; selected_model is the upstream_model.
+                requested_model_val = requested_model if isinstance(requested_model, str) else None
+                selected_model_val = upstream_model if isinstance(upstream_model, str) else None
+
+                rl.log_request(
+                    request_id=str(request_id),
+                    request_roo_code=req_payload_to_store,
+                    request_condensed=req_condensed_to_store,
+                    response_payload=resp_payload_to_store,
+                    status_code=int(status_code),
+                    error_message=error,
+                    provider_name=("vllm" if use_vllm else "routellm"),
+                    model=str(upstream_model),
+                    request_time=req_dt,
+                    response_time=resp_dt,
+                    duration_ms=duration_ms,
+                    requested_model=requested_model_val,
+                    selected_model=selected_model_val,
+                )
+            except Exception as e:
+                logger.debug(f"Request tracking log_request failed (ignored): {e}")
+
         try:
             timeout_s = float(getattr(config, "upstream_timeout_seconds", 120.0))
             # Connect failures can otherwise hang for a long time; keep this short.
@@ -1330,6 +1371,12 @@ def create_app(
                         upstream_json = {"raw_text": r.text}
 
                     if r.status_code >= 400:
+                        _log_request_tracking(
+                            response_payload=upstream_json if isinstance(upstream_json, dict) else None,
+                            status_code=r.status_code,
+                            condensed_payload=payload_nostream,
+                            error="upstream_error",
+                        )
                         return JSONResponse(status_code=r.status_code, content=upstream_json)
 
                     # Parse vLLM Hermes-format tool calls (only for vLLM responses)
@@ -1418,6 +1465,11 @@ def create_app(
                         for chunk in _completion_to_sse_events(upstream_json):
                             yield _sse_line(chunk)
 
+                    _log_request_tracking(
+                        response_payload=upstream_json if isinstance(upstream_json, dict) else None,
+                        status_code=200,
+                        condensed_payload=payload_nostream,
+                    )
                     return StreamingResponse(
                         _stream_events(),
                         media_type="text/event-stream",
@@ -1443,6 +1495,13 @@ def create_app(
                 # Parse vLLM Hermes-format tool calls (only for vLLM responses)
                 if use_vllm and r.status_code < 400:
                     data = convert_vllm_response_to_openai(data)
+
+                _log_request_tracking(
+                    response_payload=data if isinstance(data, dict) else None,
+                    status_code=int(r.status_code),
+                    condensed_payload=payload,
+                    error=("upstream_error" if int(r.status_code) >= 400 else None),
+                )
 
                 return JSONResponse(status_code=r.status_code, content=data)
 
