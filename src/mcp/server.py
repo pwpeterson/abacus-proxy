@@ -405,8 +405,7 @@ class MCPServer:
             if method == "notifications/initialized":
                 # Notification; respond with an empty result if client sent an id (rare).
                 if request_id is None:
-                    return {"jsonrpc": "2.0", "id": None, "result": {}}
-                return {"jsonrpc": "2.0", "id": request_id, "result": {}}
+                    return {"jsonrpc": "2.0", "id": request_id, "result": {}}
 
             return {
                 "jsonrpc": "2.0",
